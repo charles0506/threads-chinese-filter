@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.5.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；嚴格限定僅在「點開圖片（燈箱彈窗）」時啟用滾輪與 +/- 縮放拖曳，首頁動態牆完全不干涉正常滾動
+// @version      1.6.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -33,7 +33,7 @@
         filterTranslationPosts: true,// 命中 Threads 官方「翻譯」按鈕的外語貼文直接 100% 隱藏
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
-        enableImageZoom: true       // 是否啟用圖片縮放功能 (僅限點開圖片的燈箱模式)
+        enableImageZoom: true       // 是否啟用圖片縮放功能 (點開燈箱後生效)
     };
 
     function loadConfig() {
@@ -293,7 +293,7 @@
     }
 
     // ==========================================
-    // 5. 點開圖片專用縮放引擎 v1.5 (嚴格限定燈箱彈窗，首頁 0 干擾)
+    // 5. 點開圖片專用縮放引擎 v1.6 (相容 Threads 原生「下滑關閉」)
     // ==========================================
     let currentZoomImg = null;
     let currentScale = 1;
@@ -319,17 +319,14 @@
                 return false;
             }
 
-            // 1. 標準對話框容器
             const role = parent.getAttribute('role');
             if (role === 'dialog' || parent.getAttribute('aria-modal') === 'true') {
                 return true;
             }
 
-            // 2. Threads 全螢幕燈箱覆蓋層 (position: fixed 且覆蓋螢幕大部分面積)
             const s = window.getComputedStyle(parent);
             if (s.position === 'fixed') {
                 const rect = parent.getBoundingClientRect();
-                // 燈箱容器必須幾乎填滿視窗寬高（排除右上角小選單等）
                 if (rect.width >= window.innerWidth * 0.65 && rect.height >= window.innerHeight * 0.65) {
                     return true;
                 }
@@ -348,7 +345,6 @@
     function getActiveLightbox() {
         if (!config.enableImageZoom) return null;
 
-        // 1. 搜尋 role="dialog"
         const dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
         for (const dialog of dialogs) {
             if (dialog.offsetParent === null && window.getComputedStyle(dialog).display === 'none') continue;
@@ -359,7 +355,6 @@
             }
         }
 
-        // 2. 搜尋全螢幕 fixed 遮罩
         const allFixed = document.querySelectorAll('div');
         for (const el of allFixed) {
             if (el.id === 'threads-lang-filter-badge' || el.id === 'threads-zoom-hud') continue;
@@ -423,16 +418,16 @@
     }
 
     function zoomOut(step = 0.25) {
-        currentScale = Math.max(0.5, Math.round((currentScale - step) * 100) / 100);
-        if (currentScale <= 1) {
-            translateX = 0;
-            translateY = 0;
+        currentScale = Math.max(1.0, Math.round((currentScale - step) * 100) / 100);
+        if (currentScale <= 1.0) {
+            resetZoom();
+        } else {
+            applyImageTransform();
         }
-        applyImageTransform();
     }
 
     function resetZoom() {
-        currentScale = 1;
+        currentScale = 1.0;
         translateX = 0;
         translateY = 0;
         applyImageTransform();
@@ -448,7 +443,7 @@
             img.style.zIndex = '';
             img.style.position = '';
         }
-        currentScale = 1;
+        currentScale = 1.0;
         translateX = 0;
         translateY = 0;
         isDragging = false;
@@ -460,7 +455,7 @@
 
         const oldScale = currentScale;
         let newScale = Math.round((currentScale + zoomDelta) * 100) / 100;
-        newScale = Math.min(6.0, Math.max(0.5, newScale));
+        newScale = Math.min(6.0, Math.max(1.0, newScale));
 
         if (newScale === oldScale) return;
 
@@ -468,7 +463,7 @@
         const mouseX = clientX - (rect.left + rect.width / 2);
         const mouseY = clientY - (rect.top + rect.height / 2);
 
-        if (newScale > 1) {
+        if (newScale > 1.0) {
             const scaleRatio = 1 - newScale / oldScale;
             translateX += mouseX * scaleRatio;
             translateY += mouseY * scaleRatio;
@@ -482,41 +477,59 @@
     }
 
     // ==========================================
-    // 嚴格事件監聽：首頁 0 干涉，僅在點開圖片時生效
+    // 嚴格事件監聽：無縫相容 Threads 原生「下滑關閉」
     // ==========================================
 
-    // 1. 滑鼠滾輪縮放（首頁完全不攔截）
+    // 1. 滑鼠滾輪：
+    //    - 100% 原始大小時：向下滾動放行給 Threads 原生「下滑關閉」；向上滾動則放大圖片。
+    //    - 放大狀態 (>100%)：滾輪控制縮放，阻斷下滑關閉防止跳出；縮小回 100% 後再次向下滾動即可自然下滑關閉。
     window.addEventListener(
         'wheel',
         (e) => {
             if (!config.enableImageZoom) return;
 
-            // 取得游標下的圖片
             const elements = document.elementsFromPoint(e.clientX, e.clientY);
             let targetImg = elements.find(el => el.tagName === 'IMG' && el.naturalWidth > 80);
 
-            // 若游標在燈箱黑色背景上，尋找燈箱當前大圖
             if (!targetImg) {
                 const lightbox = getActiveLightbox();
                 if (lightbox) targetImg = lightbox.img;
             }
 
-            // 【關鍵防線】：如果這張圖片不在「點開的燈箱」內，絕對不攔截，直接放行給瀏覽器正常捲動動態牆！
+            // 非燈箱模式直接放行（首頁動態牆零干擾）
             if (!targetImg || !isImageInsideLightbox(targetImg)) {
                 return;
             }
 
-            // 確認已在燈箱內，才進行圖片縮放
+            const isZoomingIn = e.deltaY < 0;  // 滾輪向上（放大）
+            const isZoomingOut = e.deltaY > 0; // 滾輪向下（縮小 / 下滑關閉）
+
+            // 【徹底化解衝突核心】：
+            // 若當前處於 100% 原始大小且向下滾動，完全不攔截！
+            // 讓 Threads 接收事件執行原生的「下滑關閉燈箱」手勢！
+            if (currentScale <= 1.0 && isZoomingOut && !e.ctrlKey) {
+                return;
+            }
+
+            // 確認綁定當前作用圖片
             if (currentZoomImg !== targetImg) {
                 if (currentZoomImg) resetZoomState(currentZoomImg);
                 currentZoomImg = targetImg;
             }
 
+            // 放大中徹底阻止事件傳遞給 Threads，避免縮放或檢視時被判定為下滑關閉而跳出
             e.preventDefault();
             e.stopPropagation();
+            e.stopImmediatePropagation();
 
-            const delta = e.deltaY < 0 ? 0.25 : -0.25;
-            zoomAtPoint(delta, e.clientX, e.clientY);
+            const delta = isZoomingIn ? 0.25 : -0.25;
+            const nextScale = Math.round((currentScale + delta) * 100) / 100;
+
+            if (nextScale <= 1.0) {
+                resetZoom(); // 縮小回 100%，下一次再向下滾即可自然觸發 Threads 下滑關閉
+            } else {
+                zoomAtPoint(delta, e.clientX, e.clientY);
+            }
         },
         { capture: true, passive: false }
     );
@@ -539,6 +552,7 @@
                 currentZoomImg.style.cursor = 'grabbing';
                 e.preventDefault();
                 e.stopPropagation();
+                e.stopImmediatePropagation();
             }
         },
         true
@@ -552,18 +566,22 @@
             translateX = e.clientX - dragStartX;
             translateY = e.clientY - dragStartY;
             applyImageTransform(false);
+            e.stopPropagation();
+            e.stopImmediatePropagation();
         },
         true
     );
 
     window.addEventListener(
         'mouseup',
-        () => {
+        (e) => {
             if (isDragging) {
                 isDragging = false;
                 if (currentZoomImg) {
                     currentZoomImg.style.cursor = currentScale > 1 ? 'grab' : 'default';
                 }
+                e.stopPropagation();
+                e.stopImmediatePropagation();
             }
         },
         true
@@ -575,6 +593,7 @@
             if (hasDragged) {
                 e.preventDefault();
                 e.stopPropagation();
+                e.stopImmediatePropagation();
                 hasDragged = false;
             }
         },
@@ -594,13 +613,14 @@
 
             e.preventDefault();
             e.stopPropagation();
+            e.stopImmediatePropagation();
 
             if (currentZoomImg !== targetImg) {
                 if (currentZoomImg) resetZoomState(currentZoomImg);
                 currentZoomImg = targetImg;
             }
 
-            if (currentScale > 1) {
+            if (currentScale > 1.0) {
                 resetZoom();
             } else {
                 zoomAtPoint(1.25, e.clientX, e.clientY);
@@ -627,7 +647,6 @@
 
             if (!isZoomKey) return;
 
-            // 必須在已點開的燈箱內才響應按鍵
             const lightbox = getActiveLightbox();
             if (!lightbox) return;
 
@@ -661,10 +680,10 @@
     );
 
     // ==========================================
-    // 浮動控制條 (HUD - 僅在燈箱開啟時顯示)
+    // 浮動控制條 (HUD - 僅在燈箱開啟且放大時顯示)
     // ==========================================
     function renderZoomHud() {
-        if (!getActiveLightbox() && currentScale === 1) {
+        if (!getActiveLightbox() || currentScale <= 1.0) {
             removeZoomHud();
             return;
         }
@@ -735,7 +754,7 @@
         const textEl = document.getElementById('tz-zoom-text');
         if (textEl) {
             textEl.innerText = `${Math.round(currentScale * 100)}%`;
-            textEl.style.color = currentScale > 1 ? '#38bdf8' : (currentScale < 1 ? '#f87171' : '#4ade80');
+            textEl.style.color = currentScale > 1 ? '#38bdf8' : '#4ade80';
         }
     }
 
@@ -747,13 +766,12 @@
     function checkActiveImageLifecycle() {
         const lightbox = getActiveLightbox();
         if (!lightbox) {
-            // 燈箱已關閉，立刻完全重設狀態並移除 HUD，確保首頁完全乾淨
             if (currentZoomImg) {
                 resetZoomState(currentZoomImg);
                 currentZoomImg = null;
             }
             removeZoomHud();
-        } else if (lightbox.img && currentZoomImg !== lightbox.img && currentScale === 1) {
+        } else if (lightbox.img && currentZoomImg !== lightbox.img && currentScale === 1.0) {
             currentZoomImg = lightbox.img;
         }
     }
