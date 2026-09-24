@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Threads 繁簡中文過濾器
+// @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.1.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文（印尼文、英文、日文、韓文、越文等），保留含中文與純影音貼文，具備即時過濾統計與一鍵切換開關
+// @version      1.2.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援鍵盤 +/-、滾輪與工具列按鈕放大縮小，支援拖曳平移
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -32,7 +32,8 @@
         filterOtherAlphabets: true, // 是否過濾泰文、俄文、阿拉伯文等非拉丁字母語言
         filterTranslationPosts: true,// 命中 Threads 官方「翻譯」按鈕的外語貼文直接 100% 隱藏
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
-        showBadge: true             // 是否顯示右下角浮動統計膠囊
+        showBadge: true,            // 是否顯示右下角浮動統計膠囊
+        enableImageZoom: true       // 是否啟用點開圖片 +/- 放大縮小功能
     };
 
     function loadConfig() {
@@ -44,7 +45,7 @@
             const local = localStorage.getItem(STORAGE_KEY);
             if (local) return Object.assign({}, DEFAULT_CONFIG, JSON.parse(local));
         } catch (e) {
-            console.warn('[Threads Chinese Filter] 讀取設定失敗，使用預設值', e);
+            console.warn('[Threads Filter] 讀取設定失敗，使用預設值', e);
         }
         return Object.assign({}, DEFAULT_CONFIG);
     }
@@ -56,7 +57,7 @@
             }
             localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
         } catch (e) {
-            console.warn('[Threads Chinese Filter] 儲存設定失敗', e);
+            console.warn('[Threads Filter] 儲存設定失敗', e);
         }
     }
 
@@ -84,10 +85,8 @@
 
     /**
      * 檢查貼文是否帶有 Threads 官方的「翻譯」按鈕
-     * 官方若顯示翻譯按鈕，代表後端演算法已 100% 判定該貼文為非使用者偏好語系
      */
     function hasTranslationTrigger(postEl) {
-        // 搜尋 postEl 內純文字恰為「翻譯」或「查看翻譯」的按鈕/標籤
         const elements = postEl.querySelectorAll('div[role="button"], span[dir="auto"], a, span');
         for (const el of elements) {
             if (el.children.length === 0) {
@@ -117,14 +116,12 @@
      * 判斷給定貼文是否屬於非中文語言（印尼文、英文、日文、韓文等）
      */
     function isNonChinesePost(postEl, rawText) {
-        // 特徵 A：Threads 官方直接標註「翻譯」按鈕
         if (config.filterTranslationPosts && hasTranslationTrigger(postEl)) {
             return true;
         }
 
         const cleanText = cleanPostContent(rawText);
 
-        // 若無實質文字
         if (cleanText.length === 0) {
             return config.hidePureMedia;
         }
@@ -161,11 +158,8 @@
     }
 
     // ==========================================
-    // 3. Threads DOM 節點解析與抽取
+    // 3. Threads 動態牆貼文解析與過濾
     // ==========================================
-    /**
-     * 判斷是否為應略過的 UI 元件（按鈕、時間標籤、翻譯按鈕）
-     */
     function isUiElement(el) {
         if (el.closest('button')) return true;
         if (el.closest('time')) return true;
@@ -173,25 +167,18 @@
         const text = el.innerText?.trim();
         if (!text) return true;
 
-        // 相對時間（如 "2天", "6天", "3h", "15m"）
         if (/^\d+\s*([天時分秒週年月hdmsw]|小時|分鐘|秒鐘|周|週|個月|年)$/i.test(text)) return true;
-
-        // 翻譯按鈕
         if (/^(翻譯|查看翻譯|顯示翻譯|See translation|Translate)$/i.test(text)) return true;
 
         return false;
     }
 
-    /**
-     * 從貼文元素中提取主要內文（避開作者暱稱欄、時間戳記與按鈕計數）
-     */
     function extractPostText(postEl) {
         const textElements = postEl.querySelectorAll('span[dir="auto"], div[dir="auto"]');
         const textSegments = [];
 
         textElements.forEach((el) => {
             if (isUiElement(el)) return;
-            // 忽略作者連結欄位
             if (el.closest('header') || el.closest('a[role="link"][href^="/@"]')) return;
 
             const t = el.innerText?.trim();
@@ -207,15 +194,11 @@
         return postEl.innerText || '';
     }
 
-    /**
-     * 尋找 Threads 動態牆中的貼文頂層容器
-     */
     function getTopLevelPostElements() {
         const results = [];
         const candidates = document.querySelectorAll('article, div[data-pressable-container="true"]');
 
         candidates.forEach((el) => {
-            // 確保是最外層的卡片，而不是按鈕等內層可點擊元件
             if (el.parentElement && el.parentElement.closest('div[data-pressable-container="true"]')) {
                 return;
             }
@@ -225,12 +208,8 @@
         return results;
     }
 
-    // ==========================================
-    // 4. 過濾邏輯執行
-    // ==========================================
     function processFeed() {
         if (!config.enabled) {
-            // 若關閉過濾，將先前隱藏的貼文全部還原
             document.querySelectorAll('[data-threads-hidden="true"]').forEach((el) => {
                 el.style.display = '';
                 delete el.dataset.threadsHidden;
@@ -260,7 +239,7 @@
     }
 
     // ==========================================
-    // 5. 浮動統計徽章 (UI)
+    // 4. 浮動統計徽章 (動態牆過濾 UI)
     // ==========================================
     function createBadge() {
         if (!config.showBadge || badgeEl) return;
@@ -304,7 +283,6 @@
             badgeEl.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.35)';
         });
 
-        // 點擊直接切換開關
         badgeEl.addEventListener('click', () => {
             config.enabled = !config.enabled;
             saveConfig(config);
@@ -336,6 +314,313 @@
     }
 
     // ==========================================
+    // 5. 圖片彈窗 +/- 放大縮小與拖曳平移 (Image Zoom Engine)
+    // ==========================================
+    let currentZoomImg = null;
+    let currentScale = 1;
+    let translateX = 0;
+    let translateY = 0;
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+
+    /**
+     * 尋找當前畫面中開啟的圖片彈窗 (Modal/Dialog)
+     */
+    function findModalImage() {
+        if (!config.enableImageZoom) return null;
+
+        // 1. 優先搜尋 role="dialog" 或 aria-modal="true"
+        const dialogs = document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]');
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && window.getComputedStyle(dialog).display === 'none') continue;
+            const imgs = dialog.querySelectorAll('img');
+            for (const img of imgs) {
+                const rect = img.getBoundingClientRect();
+                if (rect.width >= 120 && rect.height >= 120) {
+                    return { container: dialog, img: img };
+                }
+            }
+        }
+
+        // 2. 備援：fixed 覆蓋層 (z-index 較高且包含大圖)
+        const fixedLayers = document.querySelectorAll('div[style*="fixed"]');
+        for (const el of fixedLayers) {
+            if (el.id === 'threads-lang-filter-badge' || el.id === 'threads-zoom-hud') continue;
+            const style = window.getComputedStyle(el);
+            if (style.position === 'fixed' && parseInt(style.zIndex, 10) >= 10) {
+                const imgs = el.querySelectorAll('img');
+                for (const img of imgs) {
+                    const rect = img.getBoundingClientRect();
+                    if (rect.width >= 200 && rect.height >= 200) {
+                        return { container: el, img: img };
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function applyImageTransform() {
+        if (!currentZoomImg) return;
+
+        currentZoomImg.style.transform = `translate(${translateX}px, ${translateY}px) scale(${currentScale})`;
+        currentZoomImg.style.transformOrigin = 'center center';
+        currentZoomImg.style.transition = isDragging ? 'none' : 'transform 0.15s cubic-bezier(0.2, 0, 0, 1)';
+        currentZoomImg.style.cursor = currentScale > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default';
+
+        renderZoomHud();
+    }
+
+    function zoomIn(step = 0.25) {
+        currentScale = Math.min(5.0, Math.round((currentScale + step) * 100) / 100);
+        applyImageTransform();
+    }
+
+    function zoomOut(step = 0.25) {
+        currentScale = Math.max(0.5, Math.round((currentScale - step) * 100) / 100);
+        if (currentScale <= 1) {
+            translateX = 0;
+            translateY = 0;
+        }
+        applyImageTransform();
+    }
+
+    function resetZoom() {
+        currentScale = 1;
+        translateX = 0;
+        translateY = 0;
+        applyImageTransform();
+    }
+
+    function resetZoomState(img) {
+        if (img) {
+            img.style.transform = '';
+            img.style.transformOrigin = '';
+            img.style.transition = '';
+            img.style.cursor = '';
+        }
+        currentScale = 1;
+        translateX = 0;
+        translateY = 0;
+        isDragging = false;
+    }
+
+    /**
+     * 綁定圖片互動事件 (拖曳平移、雙擊切換、滾輪縮放)
+     */
+    function attachImageInteractions(img) {
+        if (img.dataset.threadsZoomBound) return;
+        img.dataset.threadsZoomBound = 'true';
+
+        // 滑鼠拖曳平移 (當 scale > 1)
+        img.addEventListener('mousedown', (e) => {
+            if (currentScale <= 1 || e.button !== 0) return;
+            isDragging = true;
+            dragStartX = e.clientX - translateX;
+            dragStartY = e.clientY - translateY;
+            img.style.cursor = 'grabbing';
+            e.preventDefault();
+        });
+
+        // 雙擊：在 100% 與 200% 之間快速切換
+        img.addEventListener('dblclick', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (currentScale > 1) {
+                resetZoom();
+            } else {
+                currentScale = 2.0;
+                translateX = 0;
+                translateY = 0;
+                applyImageTransform();
+            }
+        });
+
+        // 滾輪縮放
+        img.addEventListener(
+            'wheel',
+            (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (e.deltaY < 0) {
+                    zoomIn(0.2);
+                } else {
+                    zoomOut(0.2);
+                }
+            },
+            { passive: false }
+        );
+    }
+
+    // 全域滑鼠拖曳監聽
+    window.addEventListener('mousemove', (e) => {
+        if (!isDragging || !currentZoomImg) return;
+        translateX = e.clientX - dragStartX;
+        translateY = e.clientY - dragStartY;
+        applyImageTransform();
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (isDragging) {
+            isDragging = false;
+            if (currentZoomImg) {
+                currentZoomImg.style.cursor = currentScale > 1 ? 'grab' : 'default';
+            }
+        }
+    });
+
+    /**
+     * 鍵盤快捷鍵監聽 (+, -, 0, Escape)
+     */
+    window.addEventListener(
+        'keydown',
+        (e) => {
+            if (!config.enableImageZoom) return;
+
+            // 忽略文字輸入框中的打字
+            const tag = e.target.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) {
+                return;
+            }
+
+            const modal = findModalImage();
+            if (!modal) return;
+
+            if (modal.img !== currentZoomImg) {
+                if (currentZoomImg) resetZoomState(currentZoomImg);
+                currentZoomImg = modal.img;
+                attachImageInteractions(currentZoomImg);
+            }
+
+            // '+' 或 '=' 或數字鍵盤 '+'
+            if (e.key === '+' || e.key === '=' || e.code === 'NumpadAdd') {
+                e.preventDefault();
+                e.stopPropagation();
+                zoomIn();
+            }
+            // '-' 或 '_' 或數字鍵盤 '-'
+            else if (e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract') {
+                e.preventDefault();
+                e.stopPropagation();
+                zoomOut();
+            }
+            // '0' 或數字鍵盤 '0'：重設縮放
+            else if (e.key === '0' || e.code === 'Numpad0') {
+                e.preventDefault();
+                e.stopPropagation();
+                resetZoom();
+            }
+            // Escape：如果已放大，先還原為 100%（不直接關閉彈窗）
+            else if (e.key === 'Escape' && currentScale > 1) {
+                e.preventDefault();
+                e.stopPropagation();
+                resetZoom();
+            }
+        },
+        true // capture phase 優先攔截
+    );
+
+    /**
+     * 渲染圖片縮放專用浮動控制條 (HUD)
+     */
+    function renderZoomHud() {
+        let hud = document.getElementById('threads-zoom-hud');
+        if (!hud) {
+            hud = document.createElement('div');
+            hud.id = 'threads-zoom-hud';
+            hud.setAttribute(
+                'style',
+                `
+                position: fixed;
+                bottom: 28px;
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 1000000;
+                background: rgba(18, 18, 18, 0.88);
+                color: #ffffff;
+                backdrop-filter: blur(14px);
+                -webkit-backdrop-filter: blur(14px);
+                padding: 6px 14px;
+                border-radius: 9999px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                font-size: 13px;
+                font-weight: 600;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                user-select: none;
+                pointer-events: auto;
+                transition: opacity 0.2s ease;
+            `
+            );
+
+            hud.innerHTML = `
+                <button id="tz-btn-out" title="縮小 (快捷鍵: -)" style="background:none;border:none;color:#fff;font-size:18px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;transition:background 0.15s;">−</button>
+                <span id="tz-zoom-text" style="min-width:48px;text-align:center;font-variant-numeric:tabular-nums;color:#4ade80;">100%</span>
+                <button id="tz-btn-in" title="放大 (快捷鍵: +)" style="background:none;border:none;color:#fff;font-size:18px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;transition:background 0.15s;">+</button>
+                <span style="opacity:0.25;margin:0 2px;">|</span>
+                <button id="tz-btn-reset" title="重設縮放 (快捷鍵: 0)" style="background:none;border:none;color:#bbb;font-size:13px;cursor:pointer;padding:2px 8px;border-radius:6px;transition:all 0.15s;">↺ 重設</button>
+            `;
+
+            document.body.appendChild(hud);
+
+            hud.querySelector('#tz-btn-out').addEventListener('click', (e) => {
+                e.stopPropagation();
+                zoomOut();
+            });
+            hud.querySelector('#tz-btn-in').addEventListener('click', (e) => {
+                e.stopPropagation();
+                zoomIn();
+            });
+            hud.querySelector('#tz-btn-reset').addEventListener('click', (e) => {
+                e.stopPropagation();
+                resetZoom();
+            });
+
+            hud.querySelectorAll('button').forEach((btn) => {
+                btn.addEventListener('mouseenter', () => (btn.style.background = 'rgba(255, 255, 255, 0.15)'));
+                btn.addEventListener('mouseleave', () => (btn.style.background = 'none'));
+            });
+        }
+
+        const textEl = document.getElementById('tz-zoom-text');
+        if (textEl) {
+            textEl.innerText = `${Math.round(currentScale * 100)}%`;
+            textEl.style.color = currentScale > 1 ? '#38bdf8' : (currentScale < 1 ? '#f87171' : '#4ade80');
+        }
+    }
+
+    function removeZoomHud() {
+        const hud = document.getElementById('threads-zoom-hud');
+        if (hud) hud.remove();
+    }
+
+    /**
+     * 檢查當前彈窗狀態並同步 HUD
+     */
+    function updateModalImageWatcher() {
+        const modal = findModalImage();
+        if (modal) {
+            if (currentZoomImg !== modal.img) {
+                if (currentZoomImg) resetZoomState(currentZoomImg);
+                currentZoomImg = modal.img;
+                attachImageInteractions(currentZoomImg);
+                renderZoomHud();
+            }
+        } else {
+            if (currentZoomImg) {
+                resetZoomState(currentZoomImg);
+                currentZoomImg = null;
+                removeZoomHud();
+            }
+        }
+    }
+
+    // ==========================================
     // 6. 油猴選單指令註冊 (Tampermonkey Menu)
     // ==========================================
     function registerMenuCommands() {
@@ -345,6 +630,15 @@
             config.enabled ? '🟢 過濾開關：[啟用中]（點擊切換）' : '⚪ 過濾開關：[已暫停]（點擊切換）',
             () => {
                 config.enabled = !config.enabled;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        GM_registerMenuCommand(
+            config.enableImageZoom ? '🔍 圖片 +/- 縮放：[開啟]（點擊切換）' : '❌ 圖片 +/- 縮放：[關閉]（點擊切換）',
+            () => {
+                config.enableImageZoom = !config.enableImageZoom;
                 saveConfig(config);
                 location.reload();
             }
@@ -396,6 +690,7 @@
             scheduled = true;
             requestAnimationFrame(() => {
                 processFeed();
+                updateModalImageWatcher();
                 scheduled = false;
             });
         }
@@ -405,11 +700,12 @@
         createBadge();
         registerMenuCommands();
         processFeed();
+        updateModalImageWatcher();
 
         const observer = new MutationObserver((mutations) => {
             let hasNewNodes = false;
             for (const m of mutations) {
-                if (m.addedNodes.length > 0) {
+                if (m.addedNodes.length > 0 || m.removedNodes.length > 0) {
                     hasNewNodes = true;
                     break;
                 }
