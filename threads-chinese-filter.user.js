@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.4.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援滑鼠滾輪平滑縮放、鍵盤 +/-、工具列按鈕與拖曳平移（穿透透明遮罩與溢出修復）
+// @version      1.5.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；嚴格限定僅在「點開圖片（燈箱彈窗）」時啟用滾輪與 +/- 縮放拖曳，首頁動態牆完全不干涉正常滾動
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -33,7 +33,7 @@
         filterTranslationPosts: true,// 命中 Threads 官方「翻譯」按鈕的外語貼文直接 100% 隱藏
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
-        enableImageZoom: true       // 是否啟用圖片縮放功能 (滾輪、+/- 鍵、拖曳)
+        enableImageZoom: true       // 是否啟用圖片縮放功能 (僅限點開圖片的燈箱模式)
     };
 
     function loadConfig() {
@@ -293,7 +293,7 @@
     }
 
     // ==========================================
-    // 5. 圖片縮放與檢視引擎 v1.4 (穿透透明遮罩與全情境定位)
+    // 5. 點開圖片專用縮放引擎 v1.5 (嚴格限定燈箱彈窗，首頁 0 干擾)
     // ==========================================
     let currentZoomImg = null;
     let currentScale = 1;
@@ -303,69 +303,82 @@
     let hasDragged = false;
     let dragStartX = 0;
     let dragStartY = 0;
-    let lastMouseX = window.innerWidth / 2;
-    let lastMouseY = window.innerHeight / 2;
-
-    window.addEventListener('mousemove', (e) => {
-        lastMouseX = e.clientX;
-        lastMouseY = e.clientY;
-    }, { passive: true });
 
     /**
-     * 穿透 Threads 所有透明遮罩與容器，全方位精準定位目標圖片
+     * 判斷某張圖片是否位於「已點開的大圖燈箱/彈窗」內
+     * 嚴格排除首頁動態牆貼文內的普通圖片
      */
-    function findTargetImage(clientX, clientY) {
+    function isImageInsideLightbox(img) {
+        if (!img) return false;
+
+        let parent = img.parentElement;
+        let depth = 0;
+
+        while (parent && parent !== document.body && depth < 10) {
+            if (parent.id === 'threads-lang-filter-badge' || parent.id === 'threads-zoom-hud') {
+                return false;
+            }
+
+            // 1. 標準對話框容器
+            const role = parent.getAttribute('role');
+            if (role === 'dialog' || parent.getAttribute('aria-modal') === 'true') {
+                return true;
+            }
+
+            // 2. Threads 全螢幕燈箱覆蓋層 (position: fixed 且覆蓋螢幕大部分面積)
+            const s = window.getComputedStyle(parent);
+            if (s.position === 'fixed') {
+                const rect = parent.getBoundingClientRect();
+                // 燈箱容器必須幾乎填滿視窗寬高（排除右上角小選單等）
+                if (rect.width >= window.innerWidth * 0.65 && rect.height >= window.innerHeight * 0.65) {
+                    return true;
+                }
+            }
+
+            parent = parent.parentElement;
+            depth++;
+        }
+
+        return false;
+    }
+
+    /**
+     * 尋找當前畫面中已被點開的燈箱彈窗大圖
+     */
+    function getActiveLightbox() {
         if (!config.enableImageZoom) return null;
 
-        // 1. 最高優先級：以游標座標穿透拾取（穿透 Threads 的 transparent touch overlay）
-        if (clientX !== undefined && clientY !== undefined) {
-            const elements = document.elementsFromPoint(clientX, clientY);
-            for (const el of elements) {
-                if (el.tagName === 'IMG' && el.naturalWidth > 80) {
-                    return el;
+        // 1. 搜尋 role="dialog"
+        const dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && window.getComputedStyle(dialog).display === 'none') continue;
+            const imgs = Array.from(dialog.querySelectorAll('img')).filter(img => img.naturalWidth > 120);
+            if (imgs.length > 0) {
+                imgs.sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
+                return { container: dialog, img: imgs[0] };
+            }
+        }
+
+        // 2. 搜尋全螢幕 fixed 遮罩
+        const allFixed = document.querySelectorAll('div');
+        for (const el of allFixed) {
+            if (el.id === 'threads-lang-filter-badge' || el.id === 'threads-zoom-hud') continue;
+            const s = window.getComputedStyle(el);
+            if (s.position === 'fixed' && parseInt(s.zIndex, 10) >= 1) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width >= window.innerWidth * 0.7 && rect.height >= window.innerHeight * 0.7) {
+                    const imgs = Array.from(el.querySelectorAll('img')).filter(img => img.naturalWidth > 150 && img.offsetWidth > 150);
+                    if (imgs.length > 0) {
+                        imgs.sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
+                        return { container: el, img: imgs[0] };
+                    }
                 }
             }
         }
 
-        // 2. 次高優先級：尋找燈箱或彈窗對話框中的主要大圖
-        const dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
-        for (const dialog of dialogs) {
-            const imgs = Array.from(dialog.querySelectorAll('img'))
-                .filter(img => img.naturalWidth > 120);
-            if (imgs.length > 0) {
-                imgs.sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
-                return imgs[0];
-            }
-        }
-
-        // 3. 第三優先級：尋找目前視窗中可見面積最大的圖片（全螢幕檢視模式）
-        const allImgs = document.querySelectorAll('img');
-        let bestImg = null;
-        let maxArea = 0;
-        const vW = window.innerWidth;
-        const vH = window.innerHeight;
-
-        for (const img of allImgs) {
-            if (img.naturalWidth < 180) continue;
-            const rect = img.getBoundingClientRect();
-            if (rect.bottom <= 0 || rect.top >= vH || rect.right <= 0 || rect.left >= vW) continue;
-
-            const visibleW = Math.min(rect.right, vW) - Math.max(rect.left, 0);
-            const visibleH = Math.min(rect.bottom, vH) - Math.max(rect.top, 0);
-            const area = visibleW * visibleH;
-
-            if (area > maxArea) {
-                maxArea = area;
-                bestImg = img;
-            }
-        }
-
-        return bestImg;
+        return null;
     }
 
-    /**
-     * 修正父層容器 overflow: hidden，防止圖片放大時邊界被裁切
-     */
     function adjustParentOverflow(img, allow) {
         let parent = img.parentElement;
         let depth = 0;
@@ -442,9 +455,6 @@
         hasDragged = false;
     }
 
-    /**
-     * 以游標位置為中心點進行平滑縮放 (Zoom toward cursor)
-     */
     function zoomAtPoint(zoomDelta, clientX, clientY) {
         if (!currentZoomImg) return;
 
@@ -471,42 +481,32 @@
         applyImageTransform(true);
     }
 
-    /**
-     * 判斷頁面當前是否處於大圖燈箱 / 彈窗模式
-     */
-    function isModalOrViewerActive(targetImg) {
-        if (document.querySelector('[role="dialog"], [aria-modal="true"]')) return true;
-        if (document.body.style.overflow === 'hidden') return true;
-        if (location.pathname.includes('/post/')) return true;
-        if (targetImg) {
-            const r = targetImg.getBoundingClientRect();
-            if (r.width >= window.innerWidth * 0.45 || r.height >= window.innerHeight * 0.45) return true;
-        }
-        return false;
-    }
-
     // ==========================================
-    // 全域事件監聽 (Capture 模式，保證穿透任何透明阻擋層)
+    // 嚴格事件監聽：首頁 0 干涉，僅在點開圖片時生效
     // ==========================================
 
-    // 1. 滑鼠滾輪縮放
+    // 1. 滑鼠滾輪縮放（首頁完全不攔截）
     window.addEventListener(
         'wheel',
         (e) => {
             if (!config.enableImageZoom) return;
 
-            const targetImg = findTargetImage(e.clientX, e.clientY);
-            if (!targetImg) return;
+            // 取得游標下的圖片
+            const elements = document.elementsFromPoint(e.clientX, e.clientY);
+            let targetImg = elements.find(el => el.tagName === 'IMG' && el.naturalWidth > 80);
 
-            // 判斷是否為燈箱大圖、或已處於放大狀態、或按住 Ctrl/Alt
-            const isModal = isModalOrViewerActive(targetImg);
-            const isAlreadyZoomed = currentScale > 1 && currentZoomImg === targetImg;
-            const isKeyModifier = e.ctrlKey || e.altKey;
-
-            if (!isModal && !isAlreadyZoomed && !isKeyModifier) {
-                return; // 動態牆滾動正常閱讀
+            // 若游標在燈箱黑色背景上，尋找燈箱當前大圖
+            if (!targetImg) {
+                const lightbox = getActiveLightbox();
+                if (lightbox) targetImg = lightbox.img;
             }
 
+            // 【關鍵防線】：如果這張圖片不在「點開的燈箱」內，絕對不攔截，直接放行給瀏覽器正常捲動動態牆！
+            if (!targetImg || !isImageInsideLightbox(targetImg)) {
+                return;
+            }
+
+            // 確認已在燈箱內，才進行圖片縮放
             if (currentZoomImg !== targetImg) {
                 if (currentZoomImg) resetZoomState(currentZoomImg);
                 currentZoomImg = targetImg;
@@ -521,11 +521,12 @@
         { capture: true, passive: false }
     );
 
-    // 2. 滑鼠左鍵拖曳平移 (Pan)
+    // 2. 滑鼠左鍵拖曳平移 (僅在燈箱且已放大時)
     window.addEventListener(
         'mousedown',
         (e) => {
             if (currentScale <= 1 || e.button !== 0 || !currentZoomImg) return;
+            if (!isImageInsideLightbox(currentZoomImg)) return;
 
             const elements = document.elementsFromPoint(e.clientX, e.clientY);
             const isTargetOrDescendant = elements.includes(currentZoomImg) || elements.some(el => el.contains(currentZoomImg));
@@ -568,7 +569,6 @@
         true
     );
 
-    // 防止拖曳後放開時誤觸 Threads 關閉燈箱或點擊連結
     window.addEventListener(
         'click',
         (e) => {
@@ -581,14 +581,16 @@
         true
     );
 
-    // 3. 雙擊切換 1x 與 2x
+    // 3. 雙擊快速縮放 (僅限燈箱內)
     window.addEventListener(
         'dblclick',
         (e) => {
             if (!config.enableImageZoom) return;
 
-            const targetImg = findTargetImage(e.clientX, e.clientY);
-            if (!targetImg) return;
+            const elements = document.elementsFromPoint(e.clientX, e.clientY);
+            const targetImg = elements.find(el => el.tagName === 'IMG' && el.naturalWidth > 80);
+
+            if (!targetImg || !isImageInsideLightbox(targetImg)) return;
 
             e.preventDefault();
             e.stopPropagation();
@@ -607,7 +609,7 @@
         true
     );
 
-    // 4. 鍵盤快捷鍵 (+, -, 0, Escape)
+    // 4. 鍵盤快捷鍵 (+, -, 0, Escape) - 僅限燈箱模式
     window.addEventListener(
         'keydown',
         (e) => {
@@ -625,8 +627,12 @@
 
             if (!isZoomKey) return;
 
-            const targetImg = currentZoomImg || findTargetImage(lastMouseX, lastMouseY);
-            if (!targetImg) return;
+            // 必須在已點開的燈箱內才響應按鍵
+            const lightbox = getActiveLightbox();
+            if (!lightbox) return;
+
+            const targetImg = currentZoomImg || lightbox.img;
+            if (!targetImg || !isImageInsideLightbox(targetImg)) return;
 
             if (currentZoomImg !== targetImg) {
                 if (currentZoomImg) resetZoomState(currentZoomImg);
@@ -655,9 +661,14 @@
     );
 
     // ==========================================
-    // 浮動控制條 (HUD)
+    // 浮動控制條 (HUD - 僅在燈箱開啟時顯示)
     // ==========================================
     function renderZoomHud() {
+        if (!getActiveLightbox() && currentScale === 1) {
+            removeZoomHud();
+            return;
+        }
+
         let hud = document.getElementById('threads-zoom-hud');
         if (!hud) {
             hud = document.createElement('div');
@@ -734,12 +745,16 @@
     }
 
     function checkActiveImageLifecycle() {
-        if (currentZoomImg && !document.body.contains(currentZoomImg)) {
-            resetZoomState(currentZoomImg);
-            currentZoomImg = null;
+        const lightbox = getActiveLightbox();
+        if (!lightbox) {
+            // 燈箱已關閉，立刻完全重設狀態並移除 HUD，確保首頁完全乾淨
+            if (currentZoomImg) {
+                resetZoomState(currentZoomImg);
+                currentZoomImg = null;
+            }
             removeZoomHud();
-        } else if (!isModalOrViewerActive(currentZoomImg) && currentScale === 1) {
-            removeZoomHud();
+        } else if (lightbox.img && currentZoomImg !== lightbox.img && currentScale === 1) {
+            currentZoomImg = lightbox.img;
         }
     }
 
@@ -759,7 +774,7 @@
         );
 
         GM_registerMenuCommand(
-            config.enableImageZoom ? '🔍 滾輪與圖片縮放：[開啟]（點擊切換）' : '❌ 滾輪與圖片縮放：[關閉]（點擊切換）',
+            config.enableImageZoom ? '🔍 點開圖片縮放：[開啟]（點擊切換）' : '❌ 點開圖片縮放：[關閉]（點擊切換）',
             () => {
                 config.enableImageZoom = !config.enableImageZoom;
                 saveConfig(config);
@@ -823,6 +838,7 @@
         createBadge();
         registerMenuCommands();
         processFeed();
+        checkActiveImageLifecycle();
 
         const observer = new MutationObserver((mutations) => {
             let hasNodes = false;
