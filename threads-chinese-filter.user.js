@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.2.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援鍵盤 +/-、滾輪與工具列按鈕放大縮小，支援拖曳平移
+// @version      1.3.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援滑鼠滾輪平滑縮放、鍵盤 +/-、工具列按鈕與拖曳平移
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -33,7 +33,7 @@
         filterTranslationPosts: true,// 命中 Threads 官方「翻譯」按鈕的外語貼文直接 100% 隱藏
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
-        enableImageZoom: true       // 是否啟用點開圖片 +/- 放大縮小功能
+        enableImageZoom: true       // 是否啟用圖片縮放功能 (滾輪、+/- 鍵、拖曳)
     };
 
     function loadConfig() {
@@ -314,7 +314,7 @@
     }
 
     // ==========================================
-    // 5. 圖片彈窗 +/- 放大縮小與拖曳平移 (Image Zoom Engine)
+    // 5. 滑鼠滾輪平滑縮放與圖片檢視引擎 (Image Zoom Engine)
     // ==========================================
     let currentZoomImg = null;
     let currentScale = 1;
@@ -325,56 +325,60 @@
     let dragStartY = 0;
 
     /**
-     * 尋找當前畫面中開啟的圖片彈窗 (Modal/Dialog)
+     * 尋找當前畫面中開啟的圖片彈窗 (Modal/Dialog/Overlay)
      */
     function findModalImage() {
         if (!config.enableImageZoom) return null;
 
-        // 1. 優先搜尋 role="dialog" 或 aria-modal="true"
+        // 1. 優先搜尋標準 role="dialog" 或 aria-modal="true"
         const dialogs = document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]');
         for (const dialog of dialogs) {
             if (dialog.offsetParent === null && window.getComputedStyle(dialog).display === 'none') continue;
             const imgs = dialog.querySelectorAll('img');
             for (const img of imgs) {
                 const rect = img.getBoundingClientRect();
-                if (rect.width >= 120 && rect.height >= 120) {
+                if (rect.width >= 100 && rect.height >= 100) {
                     return { container: dialog, img: img };
                 }
             }
         }
 
-        // 2. 備援：fixed 覆蓋層 (z-index 較高且包含大圖)
-        const fixedLayers = document.querySelectorAll('div[style*="fixed"]');
-        for (const el of fixedLayers) {
-            if (el.id === 'threads-lang-filter-badge' || el.id === 'threads-zoom-hud') continue;
-            const style = window.getComputedStyle(el);
-            if (style.position === 'fixed' && parseInt(style.zIndex, 10) >= 10) {
-                const imgs = el.querySelectorAll('img');
-                for (const img of imgs) {
-                    const rect = img.getBoundingClientRect();
-                    if (rect.width >= 200 && rect.height >= 200) {
-                        return { container: el, img: img };
+        // 2. 搜尋包含圖片的全螢幕 / 燈箱覆蓋層 (fixed 遮罩)
+        const allImgs = document.querySelectorAll('img');
+        for (const img of allImgs) {
+            const rect = img.getBoundingClientRect();
+            if (rect.width < 200 || rect.height < 200) continue;
+
+            let parent = img.parentElement;
+            while (parent && parent !== document.body) {
+                if (parent.id === 'threads-lang-filter-badge' || parent.id === 'threads-zoom-hud') break;
+                const s = window.getComputedStyle(parent);
+                if (s.position === 'fixed' || (s.position === 'absolute' && parseInt(s.zIndex, 10) >= 5)) {
+                    const pRect = parent.getBoundingClientRect();
+                    if (pRect.width >= window.innerWidth * 0.4 && pRect.height >= window.innerHeight * 0.4) {
+                        return { container: parent, img: img };
                     }
                 }
+                parent = parent.parentElement;
             }
         }
 
         return null;
     }
 
-    function applyImageTransform() {
+    function applyImageTransform(animate = true) {
         if (!currentZoomImg) return;
 
         currentZoomImg.style.transform = `translate(${translateX}px, ${translateY}px) scale(${currentScale})`;
         currentZoomImg.style.transformOrigin = 'center center';
-        currentZoomImg.style.transition = isDragging ? 'none' : 'transform 0.15s cubic-bezier(0.2, 0, 0, 1)';
+        currentZoomImg.style.transition = (isDragging || !animate) ? 'none' : 'transform 0.12s cubic-bezier(0.2, 0, 0, 1)';
         currentZoomImg.style.cursor = currentScale > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default';
 
         renderZoomHud();
     }
 
     function zoomIn(step = 0.25) {
-        currentScale = Math.min(5.0, Math.round((currentScale + step) * 100) / 100);
+        currentScale = Math.min(6.0, Math.round((currentScale + step) * 100) / 100);
         applyImageTransform();
     }
 
@@ -408,7 +412,37 @@
     }
 
     /**
-     * 綁定圖片互動事件 (拖曳平移、雙擊切換、滾輪縮放)
+     * 以滑鼠游標為中心進行平滑縮放 (Zoom toward cursor)
+     */
+    function zoomAtPoint(zoomDelta, clientX, clientY) {
+        if (!currentZoomImg) return;
+
+        const oldScale = currentScale;
+        let newScale = Math.round((currentScale + zoomDelta) * 100) / 100;
+        newScale = Math.min(6.0, Math.max(0.5, newScale));
+
+        if (newScale === oldScale) return;
+
+        const rect = currentZoomImg.getBoundingClientRect();
+        // 計算滑鼠相對於圖片視覺中心點的偏移
+        const mouseX = clientX - (rect.left + rect.width / 2);
+        const mouseY = clientY - (rect.top + rect.height / 2);
+
+        if (newScale > 1) {
+            const scaleRatio = 1 - newScale / oldScale;
+            translateX += mouseX * scaleRatio;
+            translateY += mouseY * scaleRatio;
+        } else {
+            translateX = 0;
+            translateY = 0;
+        }
+
+        currentScale = newScale;
+        applyImageTransform(true);
+    }
+
+    /**
+     * 綁定圖片互動事件 (拖曳平移、雙擊切換)
      */
     function attachImageInteractions(img) {
         if (img.dataset.threadsZoomBound) return;
@@ -431,27 +465,9 @@
             if (currentScale > 1) {
                 resetZoom();
             } else {
-                currentScale = 2.0;
-                translateX = 0;
-                translateY = 0;
-                applyImageTransform();
+                zoomAtPoint(1.0, e.clientX, e.clientY);
             }
         });
-
-        // 滾輪縮放
-        img.addEventListener(
-            'wheel',
-            (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (e.deltaY < 0) {
-                    zoomIn(0.2);
-                } else {
-                    zoomOut(0.2);
-                }
-            },
-            { passive: false }
-        );
     }
 
     // 全域滑鼠拖曳監聽
@@ -459,7 +475,7 @@
         if (!isDragging || !currentZoomImg) return;
         translateX = e.clientX - dragStartX;
         translateY = e.clientY - dragStartY;
-        applyImageTransform();
+        applyImageTransform(false);
     });
 
     window.addEventListener('mouseup', () => {
@@ -472,6 +488,43 @@
     });
 
     /**
+     * 全域滑鼠滾輪縮放監聽 (Capture 模式，保證 100% 觸發)
+     */
+    window.addEventListener(
+        'wheel',
+        (e) => {
+            if (!config.enableImageZoom) return;
+
+            const modal = findModalImage();
+            let targetImg = null;
+
+            if (modal) {
+                // 只要燈箱彈窗開啟，滾動滾輪即對彈窗圖片進行縮放
+                targetImg = modal.img;
+            } else if ((e.ctrlKey || e.altKey) && e.target.tagName === 'IMG') {
+                // 未開彈窗時：按住 Ctrl 或 Alt 滾動貼文圖片可直接縮放預覽
+                targetImg = e.target;
+            }
+
+            if (!targetImg) return;
+
+            if (currentZoomImg !== targetImg) {
+                if (currentZoomImg) resetZoomState(currentZoomImg);
+                currentZoomImg = targetImg;
+                attachImageInteractions(currentZoomImg);
+            }
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            // 滾輪向上放大，向下縮小
+            const delta = e.deltaY < 0 ? 0.2 : -0.2;
+            zoomAtPoint(delta, e.clientX, e.clientY);
+        },
+        { capture: true, passive: false }
+    );
+
+    /**
      * 鍵盤快捷鍵監聽 (+, -, 0, Escape)
      */
     window.addEventListener(
@@ -479,7 +532,6 @@
         (e) => {
             if (!config.enableImageZoom) return;
 
-            // 忽略文字輸入框中的打字
             const tag = e.target.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) {
                 return;
@@ -519,7 +571,7 @@
                 resetZoom();
             }
         },
-        true // capture phase 優先攔截
+        true
     );
 
     /**
@@ -542,7 +594,7 @@
                 color: #ffffff;
                 backdrop-filter: blur(14px);
                 -webkit-backdrop-filter: blur(14px);
-                padding: 6px 14px;
+                padding: 6px 16px;
                 border-radius: 9999px;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 font-size: 13px;
@@ -559,11 +611,13 @@
             );
 
             hud.innerHTML = `
-                <button id="tz-btn-out" title="縮小 (快捷鍵: -)" style="background:none;border:none;color:#fff;font-size:18px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;transition:background 0.15s;">−</button>
+                <button id="tz-btn-out" title="縮小 (快捷鍵: - / 滾輪向下)" style="background:none;border:none;color:#fff;font-size:18px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;transition:background 0.15s;">−</button>
                 <span id="tz-zoom-text" style="min-width:48px;text-align:center;font-variant-numeric:tabular-nums;color:#4ade80;">100%</span>
-                <button id="tz-btn-in" title="放大 (快捷鍵: +)" style="background:none;border:none;color:#fff;font-size:18px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;transition:background 0.15s;">+</button>
+                <button id="tz-btn-in" title="放大 (快捷鍵: + / 滾輪向上)" style="background:none;border:none;color:#fff;font-size:18px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;transition:background 0.15s;">+</button>
                 <span style="opacity:0.25;margin:0 2px;">|</span>
                 <button id="tz-btn-reset" title="重設縮放 (快捷鍵: 0)" style="background:none;border:none;color:#bbb;font-size:13px;cursor:pointer;padding:2px 8px;border-radius:6px;transition:all 0.15s;">↺ 重設</button>
+                <span style="opacity:0.25;margin:0 2px;">|</span>
+                <span style="font-size:11px;font-weight:400;color:#94a3b8;">🖱️ 滾輪縮放 · 拖曳平移</span>
             `;
 
             document.body.appendChild(hud);
@@ -636,7 +690,7 @@
         );
 
         GM_registerMenuCommand(
-            config.enableImageZoom ? '🔍 圖片 +/- 縮放：[開啟]（點擊切換）' : '❌ 圖片 +/- 縮放：[關閉]（點擊切換）',
+            config.enableImageZoom ? '🔍 滾輪與圖片縮放：[開啟]（點擊切換）' : '❌ 滾輪與圖片縮放：[關閉]（點擊切換）',
             () => {
                 config.enableImageZoom = !config.enableImageZoom;
                 saveConfig(config);
