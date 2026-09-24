@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.3.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援滑鼠滾輪平滑縮放、鍵盤 +/-、工具列按鈕與拖曳平移
+// @version      1.4.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援滑鼠滾輪平滑縮放、鍵盤 +/-、工具列按鈕與拖曳平移（穿透透明遮罩與溢出修復）
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -68,24 +68,15 @@
     // ==========================================
     // 2. 語言偵測與正則判斷
     // ==========================================
-    // CJK 統一漢字（繁體/簡體中文）
     const CJK_UNIFIED_REGEX = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]/;
-    // 日文平假名與片假名
     const JAPANESE_KANA_REGEX = /[\u3040-\u309f\u30a0-\u30ff]/g;
-    // 韓文字母
     const KOREAN_HANGUL_REGEX = /[\uac00-\ud7af\u1100-\u11ff]/;
-    // 泰文、俄文西里爾字母、阿拉伯文
     const OTHER_NON_LATIN_SCRIPTS = /[\u0400-\u04ff\u0600-\u06ff\u0e00-\u0e7f]/;
-    // 拉丁字母系統（英文、印尼文、馬來文、越南文、西班牙文等）
     const LATIN_WORDS_REGEX = /[a-zA-Z\u00C0-\u024F\u1E00-\u1EFF]{2,}/;
 
-    // 介面系統詞彙與時間標記（避免誤將系統中文字元當作內文）
     const SYSTEM_UI_WORDS = /\b(翻譯|查看翻譯|顯示翻譯|已編輯|已编辑|贊助|推廣|See translation|Translate)\b/gi;
     const RELATIVE_TIME_REGEX = /\b\d+\s*([天時分秒週年月hdmsw]|小時|分鐘|秒鐘|周|週|個月|年)\b/gi;
 
-    /**
-     * 檢查貼文是否帶有 Threads 官方的「翻譯」按鈕
-     */
     function hasTranslationTrigger(postEl) {
         const elements = postEl.querySelectorAll('div[role="button"], span[dir="auto"], a, span');
         for (const el of elements) {
@@ -99,9 +90,6 @@
         return false;
     }
 
-    /**
-     * 清理貼文文字，剔除系統時間、按鈕文字、網址與 tag
-     */
     function cleanPostContent(rawText) {
         if (!rawText) return '';
         return rawText
@@ -112,9 +100,6 @@
             .trim();
     }
 
-    /**
-     * 判斷給定貼文是否屬於非中文語言（印尼文、英文、日文、韓文等）
-     */
     function isNonChinesePost(postEl, rawText) {
         if (config.filterTranslationPosts && hasTranslationTrigger(postEl)) {
             return true;
@@ -126,12 +111,10 @@
             return config.hidePureMedia;
         }
 
-        // 1. 韓文檢查
         if (config.filterKorean && KOREAN_HANGUL_REGEX.test(cleanText)) {
             return true;
         }
 
-        // 2. 日文檢查：日文可能混有漢字，但假名累計出現 2 個以上即視為日文
         if (config.filterJapanese) {
             const kanaMatches = cleanText.match(JAPANESE_KANA_REGEX);
             if (kanaMatches && kanaMatches.length >= 2) {
@@ -139,16 +122,12 @@
             }
         }
 
-        // 3. 泰文、俄文、阿拉伯文等非拉丁字母語言
         if (config.filterOtherAlphabets && OTHER_NON_LATIN_SCRIPTS.test(cleanText)) {
             return true;
         }
 
-        // 4. 中文檢查：檢查是否包含任何 CJK 漢字
         const hasChinese = CJK_UNIFIED_REGEX.test(cleanText);
-
         if (!hasChinese) {
-            // 完全不含漢字，且具有實質拉丁字母（印尼文、英文、西文等）或長度 > 3
             if (LATIN_WORDS_REGEX.test(cleanText) || cleanText.length > 3) {
                 return true;
             }
@@ -314,65 +293,113 @@
     }
 
     // ==========================================
-    // 5. 滑鼠滾輪平滑縮放與圖片檢視引擎 (Image Zoom Engine)
+    // 5. 圖片縮放與檢視引擎 v1.4 (穿透透明遮罩與全情境定位)
     // ==========================================
     let currentZoomImg = null;
     let currentScale = 1;
     let translateX = 0;
     let translateY = 0;
     let isDragging = false;
+    let hasDragged = false;
     let dragStartX = 0;
     let dragStartY = 0;
+    let lastMouseX = window.innerWidth / 2;
+    let lastMouseY = window.innerHeight / 2;
+
+    window.addEventListener('mousemove', (e) => {
+        lastMouseX = e.clientX;
+        lastMouseY = e.clientY;
+    }, { passive: true });
 
     /**
-     * 尋找當前畫面中開啟的圖片彈窗 (Modal/Dialog/Overlay)
+     * 穿透 Threads 所有透明遮罩與容器，全方位精準定位目標圖片
      */
-    function findModalImage() {
+    function findTargetImage(clientX, clientY) {
         if (!config.enableImageZoom) return null;
 
-        // 1. 優先搜尋標準 role="dialog" 或 aria-modal="true"
-        const dialogs = document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]');
+        // 1. 最高優先級：以游標座標穿透拾取（穿透 Threads 的 transparent touch overlay）
+        if (clientX !== undefined && clientY !== undefined) {
+            const elements = document.elementsFromPoint(clientX, clientY);
+            for (const el of elements) {
+                if (el.tagName === 'IMG' && el.naturalWidth > 80) {
+                    return el;
+                }
+            }
+        }
+
+        // 2. 次高優先級：尋找燈箱或彈窗對話框中的主要大圖
+        const dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
         for (const dialog of dialogs) {
-            if (dialog.offsetParent === null && window.getComputedStyle(dialog).display === 'none') continue;
-            const imgs = dialog.querySelectorAll('img');
-            for (const img of imgs) {
-                const rect = img.getBoundingClientRect();
-                if (rect.width >= 100 && rect.height >= 100) {
-                    return { container: dialog, img: img };
-                }
+            const imgs = Array.from(dialog.querySelectorAll('img'))
+                .filter(img => img.naturalWidth > 120);
+            if (imgs.length > 0) {
+                imgs.sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
+                return imgs[0];
             }
         }
 
-        // 2. 搜尋包含圖片的全螢幕 / 燈箱覆蓋層 (fixed 遮罩)
+        // 3. 第三優先級：尋找目前視窗中可見面積最大的圖片（全螢幕檢視模式）
         const allImgs = document.querySelectorAll('img');
-        for (const img of allImgs) {
-            const rect = img.getBoundingClientRect();
-            if (rect.width < 200 || rect.height < 200) continue;
+        let bestImg = null;
+        let maxArea = 0;
+        const vW = window.innerWidth;
+        const vH = window.innerHeight;
 
-            let parent = img.parentElement;
-            while (parent && parent !== document.body) {
-                if (parent.id === 'threads-lang-filter-badge' || parent.id === 'threads-zoom-hud') break;
-                const s = window.getComputedStyle(parent);
-                if (s.position === 'fixed' || (s.position === 'absolute' && parseInt(s.zIndex, 10) >= 5)) {
-                    const pRect = parent.getBoundingClientRect();
-                    if (pRect.width >= window.innerWidth * 0.4 && pRect.height >= window.innerHeight * 0.4) {
-                        return { container: parent, img: img };
-                    }
-                }
-                parent = parent.parentElement;
+        for (const img of allImgs) {
+            if (img.naturalWidth < 180) continue;
+            const rect = img.getBoundingClientRect();
+            if (rect.bottom <= 0 || rect.top >= vH || rect.right <= 0 || rect.left >= vW) continue;
+
+            const visibleW = Math.min(rect.right, vW) - Math.max(rect.left, 0);
+            const visibleH = Math.min(rect.bottom, vH) - Math.max(rect.top, 0);
+            const area = visibleW * visibleH;
+
+            if (area > maxArea) {
+                maxArea = area;
+                bestImg = img;
             }
         }
 
-        return null;
+        return bestImg;
+    }
+
+    /**
+     * 修正父層容器 overflow: hidden，防止圖片放大時邊界被裁切
+     */
+    function adjustParentOverflow(img, allow) {
+        let parent = img.parentElement;
+        let depth = 0;
+        while (parent && parent !== document.body && depth < 6) {
+            if (allow) {
+                const s = window.getComputedStyle(parent);
+                if (s.overflow === 'hidden' || s.overflowX === 'hidden' || s.overflowY === 'hidden') {
+                    if (!parent.dataset.threadsOrigOverflow) {
+                        parent.dataset.threadsOrigOverflow = parent.style.overflow || 'hidden';
+                    }
+                    parent.style.overflow = 'visible';
+                }
+            } else {
+                if (parent.dataset.threadsOrigOverflow) {
+                    parent.style.overflow = parent.dataset.threadsOrigOverflow;
+                    delete parent.dataset.threadsOrigOverflow;
+                }
+            }
+            parent = parent.parentElement;
+            depth++;
+        }
     }
 
     function applyImageTransform(animate = true) {
         if (!currentZoomImg) return;
 
+        adjustParentOverflow(currentZoomImg, currentScale > 1);
+
         currentZoomImg.style.transform = `translate(${translateX}px, ${translateY}px) scale(${currentScale})`;
         currentZoomImg.style.transformOrigin = 'center center';
         currentZoomImg.style.transition = (isDragging || !animate) ? 'none' : 'transform 0.12s cubic-bezier(0.2, 0, 0, 1)';
         currentZoomImg.style.cursor = currentScale > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default';
+        currentZoomImg.style.zIndex = currentScale > 1 ? '99999' : '';
+        currentZoomImg.style.position = currentScale > 1 ? 'relative' : '';
 
         renderZoomHud();
     }
@@ -400,19 +427,23 @@
 
     function resetZoomState(img) {
         if (img) {
+            adjustParentOverflow(img, false);
             img.style.transform = '';
             img.style.transformOrigin = '';
             img.style.transition = '';
             img.style.cursor = '';
+            img.style.zIndex = '';
+            img.style.position = '';
         }
         currentScale = 1;
         translateX = 0;
         translateY = 0;
         isDragging = false;
+        hasDragged = false;
     }
 
     /**
-     * 以滑鼠游標為中心進行平滑縮放 (Zoom toward cursor)
+     * 以游標位置為中心點進行平滑縮放 (Zoom toward cursor)
      */
     function zoomAtPoint(zoomDelta, clientX, clientY) {
         if (!currentZoomImg) return;
@@ -424,7 +455,6 @@
         if (newScale === oldScale) return;
 
         const rect = currentZoomImg.getBoundingClientRect();
-        // 計算滑鼠相對於圖片視覺中心點的偏移
         const mouseX = clientX - (rect.left + rect.width / 2);
         const mouseY = clientY - (rect.top + rect.height / 2);
 
@@ -442,91 +472,142 @@
     }
 
     /**
-     * 綁定圖片互動事件 (拖曳平移、雙擊切換)
+     * 判斷頁面當前是否處於大圖燈箱 / 彈窗模式
      */
-    function attachImageInteractions(img) {
-        if (img.dataset.threadsZoomBound) return;
-        img.dataset.threadsZoomBound = 'true';
-
-        // 滑鼠拖曳平移 (當 scale > 1)
-        img.addEventListener('mousedown', (e) => {
-            if (currentScale <= 1 || e.button !== 0) return;
-            isDragging = true;
-            dragStartX = e.clientX - translateX;
-            dragStartY = e.clientY - translateY;
-            img.style.cursor = 'grabbing';
-            e.preventDefault();
-        });
-
-        // 雙擊：在 100% 與 200% 之間快速切換
-        img.addEventListener('dblclick', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (currentScale > 1) {
-                resetZoom();
-            } else {
-                zoomAtPoint(1.0, e.clientX, e.clientY);
-            }
-        });
+    function isModalOrViewerActive(targetImg) {
+        if (document.querySelector('[role="dialog"], [aria-modal="true"]')) return true;
+        if (document.body.style.overflow === 'hidden') return true;
+        if (location.pathname.includes('/post/')) return true;
+        if (targetImg) {
+            const r = targetImg.getBoundingClientRect();
+            if (r.width >= window.innerWidth * 0.45 || r.height >= window.innerHeight * 0.45) return true;
+        }
+        return false;
     }
 
-    // 全域滑鼠拖曳監聽
-    window.addEventListener('mousemove', (e) => {
-        if (!isDragging || !currentZoomImg) return;
-        translateX = e.clientX - dragStartX;
-        translateY = e.clientY - dragStartY;
-        applyImageTransform(false);
-    });
+    // ==========================================
+    // 全域事件監聽 (Capture 模式，保證穿透任何透明阻擋層)
+    // ==========================================
 
-    window.addEventListener('mouseup', () => {
-        if (isDragging) {
-            isDragging = false;
-            if (currentZoomImg) {
-                currentZoomImg.style.cursor = currentScale > 1 ? 'grab' : 'default';
-            }
-        }
-    });
-
-    /**
-     * 全域滑鼠滾輪縮放監聽 (Capture 模式，保證 100% 觸發)
-     */
+    // 1. 滑鼠滾輪縮放
     window.addEventListener(
         'wheel',
         (e) => {
             if (!config.enableImageZoom) return;
 
-            const modal = findModalImage();
-            let targetImg = null;
-
-            if (modal) {
-                // 只要燈箱彈窗開啟，滾動滾輪即對彈窗圖片進行縮放
-                targetImg = modal.img;
-            } else if ((e.ctrlKey || e.altKey) && e.target.tagName === 'IMG') {
-                // 未開彈窗時：按住 Ctrl 或 Alt 滾動貼文圖片可直接縮放預覽
-                targetImg = e.target;
-            }
-
+            const targetImg = findTargetImage(e.clientX, e.clientY);
             if (!targetImg) return;
+
+            // 判斷是否為燈箱大圖、或已處於放大狀態、或按住 Ctrl/Alt
+            const isModal = isModalOrViewerActive(targetImg);
+            const isAlreadyZoomed = currentScale > 1 && currentZoomImg === targetImg;
+            const isKeyModifier = e.ctrlKey || e.altKey;
+
+            if (!isModal && !isAlreadyZoomed && !isKeyModifier) {
+                return; // 動態牆滾動正常閱讀
+            }
 
             if (currentZoomImg !== targetImg) {
                 if (currentZoomImg) resetZoomState(currentZoomImg);
                 currentZoomImg = targetImg;
-                attachImageInteractions(currentZoomImg);
             }
 
             e.preventDefault();
             e.stopPropagation();
 
-            // 滾輪向上放大，向下縮小
-            const delta = e.deltaY < 0 ? 0.2 : -0.2;
+            const delta = e.deltaY < 0 ? 0.25 : -0.25;
             zoomAtPoint(delta, e.clientX, e.clientY);
         },
         { capture: true, passive: false }
     );
 
-    /**
-     * 鍵盤快捷鍵監聽 (+, -, 0, Escape)
-     */
+    // 2. 滑鼠左鍵拖曳平移 (Pan)
+    window.addEventListener(
+        'mousedown',
+        (e) => {
+            if (currentScale <= 1 || e.button !== 0 || !currentZoomImg) return;
+
+            const elements = document.elementsFromPoint(e.clientX, e.clientY);
+            const isTargetOrDescendant = elements.includes(currentZoomImg) || elements.some(el => el.contains(currentZoomImg));
+
+            if (isTargetOrDescendant) {
+                isDragging = true;
+                hasDragged = false;
+                dragStartX = e.clientX - translateX;
+                dragStartY = e.clientY - translateY;
+                currentZoomImg.style.cursor = 'grabbing';
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        },
+        true
+    );
+
+    window.addEventListener(
+        'mousemove',
+        (e) => {
+            if (!isDragging || !currentZoomImg) return;
+            hasDragged = true;
+            translateX = e.clientX - dragStartX;
+            translateY = e.clientY - dragStartY;
+            applyImageTransform(false);
+        },
+        true
+    );
+
+    window.addEventListener(
+        'mouseup',
+        () => {
+            if (isDragging) {
+                isDragging = false;
+                if (currentZoomImg) {
+                    currentZoomImg.style.cursor = currentScale > 1 ? 'grab' : 'default';
+                }
+            }
+        },
+        true
+    );
+
+    // 防止拖曳後放開時誤觸 Threads 關閉燈箱或點擊連結
+    window.addEventListener(
+        'click',
+        (e) => {
+            if (hasDragged) {
+                e.preventDefault();
+                e.stopPropagation();
+                hasDragged = false;
+            }
+        },
+        true
+    );
+
+    // 3. 雙擊切換 1x 與 2x
+    window.addEventListener(
+        'dblclick',
+        (e) => {
+            if (!config.enableImageZoom) return;
+
+            const targetImg = findTargetImage(e.clientX, e.clientY);
+            if (!targetImg) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (currentZoomImg !== targetImg) {
+                if (currentZoomImg) resetZoomState(currentZoomImg);
+                currentZoomImg = targetImg;
+            }
+
+            if (currentScale > 1) {
+                resetZoom();
+            } else {
+                zoomAtPoint(1.25, e.clientX, e.clientY);
+            }
+        },
+        true
+    );
+
+    // 4. 鍵盤快捷鍵 (+, -, 0, Escape)
     window.addEventListener(
         'keydown',
         (e) => {
@@ -537,35 +618,34 @@
                 return;
             }
 
-            const modal = findModalImage();
-            if (!modal) return;
+            const isZoomKey = e.key === '+' || e.key === '=' || e.code === 'NumpadAdd' ||
+                              e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract' ||
+                              e.key === '0' || e.code === 'Numpad0' ||
+                              (e.key === 'Escape' && currentScale > 1);
 
-            if (modal.img !== currentZoomImg) {
+            if (!isZoomKey) return;
+
+            const targetImg = currentZoomImg || findTargetImage(lastMouseX, lastMouseY);
+            if (!targetImg) return;
+
+            if (currentZoomImg !== targetImg) {
                 if (currentZoomImg) resetZoomState(currentZoomImg);
-                currentZoomImg = modal.img;
-                attachImageInteractions(currentZoomImg);
+                currentZoomImg = targetImg;
             }
 
-            // '+' 或 '=' 或數字鍵盤 '+'
             if (e.key === '+' || e.key === '=' || e.code === 'NumpadAdd') {
                 e.preventDefault();
                 e.stopPropagation();
                 zoomIn();
-            }
-            // '-' 或 '_' 或數字鍵盤 '-'
-            else if (e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract') {
+            } else if (e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract') {
                 e.preventDefault();
                 e.stopPropagation();
                 zoomOut();
-            }
-            // '0' 或數字鍵盤 '0'：重設縮放
-            else if (e.key === '0' || e.code === 'Numpad0') {
+            } else if (e.key === '0' || e.code === 'Numpad0') {
                 e.preventDefault();
                 e.stopPropagation();
                 resetZoom();
-            }
-            // Escape：如果已放大，先還原為 100%（不直接關閉彈窗）
-            else if (e.key === 'Escape' && currentScale > 1) {
+            } else if (e.key === 'Escape' && currentScale > 1) {
                 e.preventDefault();
                 e.stopPropagation();
                 resetZoom();
@@ -574,9 +654,9 @@
         true
     );
 
-    /**
-     * 渲染圖片縮放專用浮動控制條 (HUD)
-     */
+    // ==========================================
+    // 浮動控制條 (HUD)
+    // ==========================================
     function renderZoomHud() {
         let hud = document.getElementById('threads-zoom-hud');
         if (!hud) {
@@ -653,24 +733,13 @@
         if (hud) hud.remove();
     }
 
-    /**
-     * 檢查當前彈窗狀態並同步 HUD
-     */
-    function updateModalImageWatcher() {
-        const modal = findModalImage();
-        if (modal) {
-            if (currentZoomImg !== modal.img) {
-                if (currentZoomImg) resetZoomState(currentZoomImg);
-                currentZoomImg = modal.img;
-                attachImageInteractions(currentZoomImg);
-                renderZoomHud();
-            }
-        } else {
-            if (currentZoomImg) {
-                resetZoomState(currentZoomImg);
-                currentZoomImg = null;
-                removeZoomHud();
-            }
+    function checkActiveImageLifecycle() {
+        if (currentZoomImg && !document.body.contains(currentZoomImg)) {
+            resetZoomState(currentZoomImg);
+            currentZoomImg = null;
+            removeZoomHud();
+        } else if (!isModalOrViewerActive(currentZoomImg) && currentScale === 1) {
+            removeZoomHud();
         }
     }
 
@@ -744,7 +813,7 @@
             scheduled = true;
             requestAnimationFrame(() => {
                 processFeed();
-                updateModalImageWatcher();
+                checkActiveImageLifecycle();
                 scheduled = false;
             });
         }
@@ -754,17 +823,16 @@
         createBadge();
         registerMenuCommands();
         processFeed();
-        updateModalImageWatcher();
 
         const observer = new MutationObserver((mutations) => {
-            let hasNewNodes = false;
+            let hasNodes = false;
             for (const m of mutations) {
                 if (m.addedNodes.length > 0 || m.removedNodes.length > 0) {
-                    hasNewNodes = true;
+                    hasNodes = true;
                     break;
                 }
             }
-            if (hasNewNodes) {
+            if (hasNodes) {
                 scheduleProcess();
             }
         });
