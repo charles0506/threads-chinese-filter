@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.7.0
+// @version      1.7.1
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -72,9 +72,19 @@
     // ==========================================
     // 2. 語言偵測與正則判斷
     // ==========================================
-    const CJK_UNIFIED_REGEX = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]/;
-    const JAPANESE_KANA_REGEX = /[\u3040-\u309f\u30a0-\u30ff]/g;
-    const KOREAN_HANGUL_REGEX = /[\uac00-\ud7af\u1100-\u11ff]/;
+    const CJK_UNIFIED_REGEX = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]/g;
+    // \u53ea\u7b97\u771f\u6b63\u7684\u5047\u540d\u5b57\u6bcd\uff0c\u4e0d\u542b\u300c\u30fb\u300d\u300c\u30fc\u300d\u9019\u985e\u4e2d\u6587\u8cbc\u6587\u4e5f\u6703\u51fa\u73fe\u7684\u7b26\u865f
+    const JAPANESE_KANA_REGEX = /[\u3041-\u3096\u30a1-\u30fa]/g;
+    const KOREAN_HANGUL_REGEX = /[\uac00-\ud7af\u1100-\u11ff]/g;
+
+    // \u4e2d\u6587\u70ba\u4e3b\u3001\u53ea\u593e\u96dc\u5c11\u91cf\u65e5\u97d3\u6587\u7684\u8cbc\u6587\u8981\u4fdd\u7559\uff1a\u5916\u6587\u5b57\u6578\u76f8\u5c0d\u6f22\u5b57\u6578\u8d85\u904e\u6b64\u6bd4\u4f8b\u624d\u8996\u70ba\u5916\u6587\u8cbc\u6587
+    const KANA_TO_HAN_RATIO = 0.3;
+    const HANGUL_TO_HAN_RATIO = 0.5;
+
+    function countMatches(text, regex) {
+        const m = text.match(regex);
+        return m ? m.length : 0;
+    }
     const OTHER_NON_LATIN_SCRIPTS = /[\u0400-\u04ff\u0600-\u06ff\u0e00-\u0e7f]/;
     const LATIN_WORDS_REGEX = /[a-zA-Z\u00C0-\u024F\u1E00-\u1EFF]{2,}/;
 
@@ -118,13 +128,18 @@
             return config.hidePureMedia ? '純影音' : null;
         }
 
-        if (config.filterKorean && KOREAN_HANGUL_REGEX.test(cleanText)) {
-            return '韓文';
+        const hanCount = countMatches(cleanText, CJK_UNIFIED_REGEX);
+
+        if (config.filterKorean) {
+            const hangulCount = countMatches(cleanText, KOREAN_HANGUL_REGEX);
+            if (hangulCount > 0 && hangulCount > hanCount * HANGUL_TO_HAN_RATIO) {
+                return '韓文';
+            }
         }
 
         if (config.filterJapanese) {
-            const kanaMatches = cleanText.match(JAPANESE_KANA_REGEX);
-            if (kanaMatches && kanaMatches.length >= 2) {
+            const kanaCount = countMatches(cleanText, JAPANESE_KANA_REGEX);
+            if (kanaCount >= 2 && kanaCount > hanCount * KANA_TO_HAN_RATIO) {
                 return '日文';
             }
         }
@@ -133,8 +148,7 @@
             return '其他文字';
         }
 
-        const hasChinese = CJK_UNIFIED_REGEX.test(cleanText);
-        if (!hasChinese) {
+        if (hanCount === 0) {
             if (LATIN_WORDS_REGEX.test(cleanText) || cleanText.length > 3) {
                 return '無中文';
             }
