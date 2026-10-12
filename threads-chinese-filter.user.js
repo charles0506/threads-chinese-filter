@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.7.1
+// @version      1.8.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -33,7 +33,8 @@
         filterTranslationPosts: true,// 命中 Threads 官方「翻譯」按鈕的外語貼文直接 100% 隱藏
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
-        enableImageZoom: true       // 是否啟用圖片縮放功能 (點開燈箱後生效)
+        enableImageZoom: true,      // 是否啟用圖片縮放功能 (點開燈箱後生效)
+        filterScamAccounts: true    // 是否隱藏帶「[新帳號]」標籤且地區非台灣的帳號貼文
     };
 
     function loadConfig() {
@@ -114,10 +115,34 @@
             .trim();
     }
 
+    // 帳號地區標籤，例如「🇲🇾 馬來西亞[新帳號]」：國旗 + 地區名 + [新帳號]
+    const NEW_ACCOUNT_TAG = '[新帳號]';
+    const NEW_ACCOUNT_LABEL_REGEX = /([\u{1F1E6}-\u{1F1FF}]{2})?([^\[\]\u{1F1E6}-\u{1F1FF}]{0,12})\[新帳號\]/u;
+    const TAIWAN_REGEX = /🇹🇼|台灣|臺灣|Taiwan/i;
+
+    /**
+     * 新帳號且地區不是台灣，視為詐騙帳號
+     */
+    function isScamAccount(postEl) {
+        const text = postEl.textContent || '';
+        if (!text.includes(NEW_ACCOUNT_TAG)) return false;
+
+        const m = text.match(NEW_ACCOUNT_LABEL_REGEX);
+        if (!m) return false;
+
+        // 有國旗就只看國旗；地區名前面可能黏著貼文其他文字，不可靠
+        if (m[1]) return m[1] !== '🇹🇼';
+        return !TAIWAN_REGEX.test(m[2]);
+    }
+
     /**
      * 判斷貼文是否該隱藏；要隱藏回傳原因字串，否則回傳 null
      */
     function getHideReason(postEl, rawText) {
+        if (config.filterScamAccounts && isScamAccount(postEl)) {
+            return '詐騙帳號';
+        }
+
         if (config.filterTranslationPosts && hasTranslationTrigger(postEl)) {
             return '翻譯按鈕';
         }
@@ -221,7 +246,10 @@
         const posts = getTopLevelPostElements();
 
         posts.forEach((post) => {
-            if (post.dataset.threadsFiltered) return;
+            const state = post.dataset.threadsFiltered;
+            if (state === 'hidden') return;
+            // 帳號地區標籤是事後才補到貼文上的，已放行的貼文要再查一次
+            if (state === 'kept' && !(config.filterScamAccounts && isScamAccount(post))) return;
 
             const contentText = extractPostText(post);
             const info = getPostInfo(post);
@@ -1032,7 +1060,16 @@
         );
 
         GM_registerMenuCommand(
-            config.hidePureMedia ? '✅ 無文字純影音：[隱藏]（點擊切換）' : '❌ 無文字純影音：[保留]（點擊切換）',
+            config.filterScamAccounts ? '✅ 非台灣新帳號（詐騙）：[隱藏]（點擊切換）' : '❌ 非台灣新帳號（詐騙）：[保留]（點擊切換）',
+            () => {
+                config.filterScamAccounts = !config.filterScamAccounts;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        GM_registerMenuCommand(
+            config.hidePureMedia ?'✅ 無文字純影音：[隱藏]（點擊切換）' : '❌ 無文字純影音：[保留]（點擊切換）',
             () => {
                 config.hidePureMedia = !config.hidePureMedia;
                 saveConfig(config);
