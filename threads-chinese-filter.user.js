@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.6.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
+// @version      1.7.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -62,8 +62,12 @@
     }
 
     let config = loadConfig();
-    let hiddenCount = 0;
+    const hiddenPosts = new Map();   // key -> { el, author, text, reason, href }，被過濾的貼文清單
+    const restoredKeys = new Set();  // 使用者手動還原的貼文，之後不再隱藏
     let badgeEl = null;
+    let panelEl = null;
+    let panelDirty = false;
+    let lastBadgeState = '';
 
     // ==========================================
     // 2. 語言偵測與正則判斷
@@ -100,40 +104,43 @@
             .trim();
     }
 
-    function isNonChinesePost(postEl, rawText) {
+    /**
+     * 判斷貼文是否該隱藏；要隱藏回傳原因字串，否則回傳 null
+     */
+    function getHideReason(postEl, rawText) {
         if (config.filterTranslationPosts && hasTranslationTrigger(postEl)) {
-            return true;
+            return '翻譯按鈕';
         }
 
         const cleanText = cleanPostContent(rawText);
 
         if (cleanText.length === 0) {
-            return config.hidePureMedia;
+            return config.hidePureMedia ? '純影音' : null;
         }
 
         if (config.filterKorean && KOREAN_HANGUL_REGEX.test(cleanText)) {
-            return true;
+            return '韓文';
         }
 
         if (config.filterJapanese) {
             const kanaMatches = cleanText.match(JAPANESE_KANA_REGEX);
             if (kanaMatches && kanaMatches.length >= 2) {
-                return true;
+                return '日文';
             }
         }
 
         if (config.filterOtherAlphabets && OTHER_NON_LATIN_SCRIPTS.test(cleanText)) {
-            return true;
+            return '其他文字';
         }
 
         const hasChinese = CJK_UNIFIED_REGEX.test(cleanText);
         if (!hasChinese) {
             if (LATIN_WORDS_REGEX.test(cleanText) || cleanText.length > 3) {
-                return true;
+                return '無中文';
             }
         }
 
-        return false;
+        return null;
     }
 
     // ==========================================
@@ -203,17 +210,74 @@
             if (post.dataset.threadsFiltered) return;
 
             const contentText = extractPostText(post);
-            const shouldHide = isNonChinesePost(post, contentText);
+            const info = getPostInfo(post);
+            // 以貼文連結當 key，Threads 重繪同一則貼文時不會重複計數
+            const key = info.href || `${info.author}|${contentText.slice(0, 80)}`;
+            const reason = restoredKeys.has(key) ? null : getHideReason(post, contentText);
 
-            if (shouldHide) {
+            if (reason) {
                 post.style.display = 'none';
                 post.dataset.threadsHidden = 'true';
-                hiddenCount++;
+
+                const existing = hiddenPosts.get(key);
+                if (existing) {
+                    existing.el = post;
+                } else {
+                    hiddenPosts.set(key, {
+                        el: post,
+                        author: info.author,
+                        href: info.href,
+                        text: contentText.trim(),
+                        reason
+                    });
+                    panelDirty = true;
+                }
             }
 
-            post.dataset.threadsFiltered = shouldHide ? 'hidden' : 'kept';
+            post.dataset.threadsFiltered = reason ? 'hidden' : 'kept';
         });
 
+        updateBadge();
+    }
+
+    function getPostInfo(postEl) {
+        const authorLink = postEl.querySelector('a[href^="/@"]');
+        const authorMatch = authorLink ? authorLink.getAttribute('href').match(/^\/@([^/?#]+)/) : null;
+        const postLink = postEl.querySelector('a[href*="/post/"]');
+
+        return {
+            author: authorMatch ? authorMatch[1] : '',
+            href: postLink ? new URL(postLink.getAttribute('href'), location.origin).href : ''
+        };
+    }
+
+    function toggleEnabled() {
+        config.enabled = !config.enabled;
+        saveConfig(config);
+        document.querySelectorAll('[data-threads-filtered]').forEach((el) => {
+            delete el.dataset.threadsFiltered;
+        });
+        hiddenPosts.clear();
+        restoredKeys.clear();
+        panelDirty = true;
+        processFeed();
+    }
+
+    function restorePost(key) {
+        const item = hiddenPosts.get(key);
+        if (!item) return;
+
+        restoredKeys.add(key);
+        hiddenPosts.delete(key);
+
+        if (item.el && item.el.isConnected) {
+            item.el.style.display = '';
+            delete item.el.dataset.threadsHidden;
+            item.el.dataset.threadsFiltered = 'kept';
+            item.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        panelDirty = true;
         updateBadge();
     }
 
@@ -262,15 +326,7 @@
             badgeEl.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.35)';
         });
 
-        badgeEl.addEventListener('click', () => {
-            config.enabled = !config.enabled;
-            saveConfig(config);
-            document.querySelectorAll('[data-threads-filtered]').forEach((el) => {
-                delete el.dataset.threadsFiltered;
-            });
-            hiddenCount = 0;
-            processFeed();
-        });
+        badgeEl.addEventListener('click', togglePanel);
 
         document.body.appendChild(badgeEl);
         updateBadge();
@@ -279,17 +335,151 @@
     function updateBadge() {
         if (!badgeEl) return;
 
-        if (!config.enabled) {
-            badgeEl.innerHTML = '⏸️ <span style="opacity: 0.85;">中文過濾已暫停</span>';
-            badgeEl.style.borderColor = 'rgba(255, 255, 255, 0.1)';
-            badgeEl.style.background = 'rgba(40, 40, 40, 0.85)';
-            badgeEl.title = '點擊恢復過濾';
-        } else {
-            badgeEl.innerHTML = `🉐 <span style="color: #4ade80;">過濾中</span> · 已隱藏 <b>${hiddenCount}</b> 則`;
-            badgeEl.style.borderColor = 'rgba(74, 222, 128, 0.3)';
-            badgeEl.style.background = 'rgba(18, 18, 18, 0.88)';
-            badgeEl.title = '點擊暫停過濾';
+        // 狀態沒變就不重寫 DOM，避免觸發 MutationObserver 造成每幀空轉
+        const state = `${config.enabled}|${hiddenPosts.size}`;
+        if (state !== lastBadgeState) {
+            lastBadgeState = state;
+
+            if (!config.enabled) {
+                badgeEl.innerHTML = '⏸️ <span style="opacity: 0.85;">中文過濾已暫停</span>';
+                badgeEl.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+                badgeEl.style.background = 'rgba(40, 40, 40, 0.85)';
+            } else {
+                badgeEl.innerHTML = `🉐 <span style="color: #4ade80;">過濾中</span> · 已隱藏 <b>${hiddenPosts.size}</b> 則`;
+                badgeEl.style.borderColor = 'rgba(74, 222, 128, 0.3)';
+                badgeEl.style.background = 'rgba(18, 18, 18, 0.88)';
+            }
+            badgeEl.title = '點擊查看被過濾的貼文';
         }
+
+        renderPanel();
+    }
+
+    // ==========================================
+    // 4-1. 被過濾貼文清單面板 (點擊徽章開關)
+    // ==========================================
+    const PANEL_BTN_STYLE = 'background:rgba(255,255,255,0.1);border:none;color:#fff;font-size:12px;cursor:pointer;padding:3px 10px;border-radius:6px;text-decoration:none;';
+
+    function togglePanel() {
+        if (panelEl) {
+            panelEl.remove();
+            panelEl = null;
+            return;
+        }
+
+        panelEl = document.createElement('div');
+        panelEl.id = 'threads-lang-filter-panel';
+        panelEl.setAttribute(
+            'style',
+            `
+            position: fixed;
+            bottom: 62px;
+            right: 20px;
+            z-index: 999999;
+            width: 360px;
+            max-width: calc(100vw - 40px);
+            max-height: 60vh;
+            display: flex;
+            flex-direction: column;
+            background: rgba(18, 18, 18, 0.96);
+            color: #ffffff;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border-radius: 14px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-size: 13px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+            overflow: hidden;
+        `
+        );
+
+        document.body.appendChild(panelEl);
+        panelDirty = true;
+        renderPanel();
+    }
+
+    function makePanelButton(label, onClick) {
+        const btn = document.createElement('button');
+        btn.textContent = label;
+        btn.setAttribute('style', PANEL_BTN_STYLE);
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            onClick();
+        });
+        return btn;
+    }
+
+    function renderPanel() {
+        if (!panelEl || !panelDirty) return;
+        panelDirty = false;
+
+        // 貼文內容一律用 textContent 塞入，不走 innerHTML
+        panelEl.textContent = '';
+
+        const header = document.createElement('div');
+        header.setAttribute('style', 'display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,0.12);');
+
+        const title = document.createElement('b');
+        title.textContent = `被過濾的貼文（${hiddenPosts.size}）`;
+        title.style.flex = '1';
+        header.appendChild(title);
+        header.appendChild(makePanelButton(config.enabled ? '暫停過濾' : '恢復過濾', toggleEnabled));
+        header.appendChild(makePanelButton('✕', togglePanel));
+        panelEl.appendChild(header);
+
+        const list = document.createElement('div');
+        list.setAttribute('style', 'overflow-y:auto;flex:1;');
+
+        if (hiddenPosts.size === 0) {
+            const empty = document.createElement('div');
+            empty.textContent = config.enabled ? '目前沒有被過濾的貼文' : '過濾已暫停';
+            empty.setAttribute('style', 'padding:18px 12px;text-align:center;opacity:0.6;');
+            list.appendChild(empty);
+        }
+
+        // 最新被過濾的排最上面
+        Array.from(hiddenPosts.entries()).reverse().forEach(([key, item]) => {
+            const row = document.createElement('div');
+            row.setAttribute('style', 'padding:10px 12px;border-bottom:1px solid rgba(255,255,255,0.08);');
+
+            const meta = document.createElement('div');
+            meta.setAttribute('style', 'display:flex;align-items:center;gap:6px;margin-bottom:4px;');
+
+            const author = document.createElement('b');
+            author.textContent = item.author ? `@${item.author}` : '（未知作者）';
+            meta.appendChild(author);
+
+            const reason = document.createElement('span');
+            reason.textContent = item.reason;
+            reason.setAttribute('style', 'font-size:11px;color:#4ade80;border:1px solid rgba(74,222,128,0.35);border-radius:9999px;padding:0 7px;');
+            meta.appendChild(reason);
+            row.appendChild(meta);
+
+            const text = document.createElement('div');
+            text.textContent = item.text ? (item.text.length > 160 ? item.text.slice(0, 160) + '…' : item.text) : '（無文字）';
+            text.setAttribute('style', 'opacity:0.85;line-height:1.45;white-space:pre-wrap;word-break:break-word;margin-bottom:6px;');
+            row.appendChild(text);
+
+            const actions = document.createElement('div');
+            actions.setAttribute('style', 'display:flex;gap:6px;');
+            actions.appendChild(makePanelButton('還原顯示', () => restorePost(key)));
+
+            if (item.href) {
+                const link = document.createElement('a');
+                link.textContent = '開啟貼文';
+                link.href = item.href;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.setAttribute('style', PANEL_BTN_STYLE);
+                actions.appendChild(link);
+            }
+
+            row.appendChild(actions);
+            list.appendChild(row);
+        });
+
+        panelEl.appendChild(list);
     }
 
     // ==========================================
@@ -315,7 +505,7 @@
         let depth = 0;
 
         while (parent && parent !== document.body && depth < 10) {
-            if (parent.id === 'threads-lang-filter-badge' || parent.id === 'threads-zoom-hud') {
+            if (parent.id === 'threads-lang-filter-badge' || parent.id === 'threads-lang-filter-panel' || parent.id === 'threads-zoom-hud') {
                 return false;
             }
 
