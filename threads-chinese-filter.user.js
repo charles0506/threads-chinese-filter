@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.11.0
+// @version      1.11.1
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -119,6 +119,12 @@
         return false;
     }
 
+    // 帳號地區標籤（例「🇲🇽 墨西哥」）是中文字，不剔除會讓外文貼文被當成中文
+    const REGION_LABEL_REGEX = /[\u{1F1E6}-\u{1F1FF}]{2}\s*[^\s[\]]{0,12}(\[新帳號\])?/gu;
+
+    // 圖片/影片貼文只有短說明（例「Good morning ☀️」）才保留；整句外文的照常過濾
+    const MEDIA_CAPTION_MAX_LETTERS = 20;
+
     function cleanPostContent(rawText) {
         if (!rawText) return '';
         return rawText
@@ -126,6 +132,7 @@
             .replace(/[@#][\w\d_.-]+/g, '')
             .replace(SYSTEM_UI_WORDS, '')
             .replace(RELATIVE_TIME_REGEX, '')
+            .replace(REGION_LABEL_REGEX, '')
             .trim();
     }
 
@@ -183,7 +190,10 @@
             return '詐騙帳號';
         }
 
-        if (config.keepMediaPosts && hasMedia(postEl)) {
+        const cleanText = cleanPostContent(rawText);
+        const letterCount = countMatches(cleanText, /\p{L}/gu);
+
+        if (config.keepMediaPosts && letterCount <= MEDIA_CAPTION_MAX_LETTERS && hasMedia(postEl)) {
             return null;
         }
 
@@ -191,10 +201,7 @@
             return '翻譯按鈕';
         }
 
-        const cleanText = cleanPostContent(rawText);
-
         // 只剩數字、標點、emoji 這類沒有語言可判斷的內文，當成純影音貼文處理
-        const letterCount = countMatches(cleanText, /\p{L}/gu);
         if (letterCount === 0) {
             return config.hidePureMedia ? '純影音' : null;
         }
