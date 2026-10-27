@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.9.0
+// @version      1.9.1
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -173,7 +173,9 @@
 
         const cleanText = cleanPostContent(rawText);
 
-        if (cleanText.length === 0) {
+        // 只剩數字、標點、emoji 這類沒有語言可判斷的內文，當成純影音貼文處理
+        const letterCount = countMatches(cleanText, /\p{L}/gu);
+        if (letterCount === 0) {
             return config.hidePureMedia ? '純影音' : null;
         }
 
@@ -198,7 +200,7 @@
         }
 
         if (hanCount === 0) {
-            if (LATIN_WORDS_REGEX.test(cleanText) || cleanText.length > 3) {
+            if (LATIN_WORDS_REGEX.test(cleanText) || letterCount > 3) {
                 return '無中文';
             }
         }
