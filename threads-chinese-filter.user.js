@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.8.0
+// @version      1.9.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -34,21 +34,31 @@
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
         enableImageZoom: true,      // 是否啟用圖片縮放功能 (點開燈箱後生效)
-        filterScamAccounts: true    // 是否隱藏帶「[新帳號]」標籤且地區非台灣的帳號貼文
+        scamMode: 'warn'            // 非台灣新帳號貼文：'warn' 加紅框提醒 / 'hide' 直接隱藏 / 'off' 不處理
     };
 
     function loadConfig() {
+        let cfg = null;
         try {
             if (typeof GM_getValue === 'function') {
                 const stored = GM_getValue(STORAGE_KEY, null);
-                if (stored) return Object.assign({}, DEFAULT_CONFIG, typeof stored === 'string' ? JSON.parse(stored) : stored);
+                if (stored) cfg = Object.assign({}, DEFAULT_CONFIG, typeof stored === 'string' ? JSON.parse(stored) : stored);
             }
-            const local = localStorage.getItem(STORAGE_KEY);
-            if (local) return Object.assign({}, DEFAULT_CONFIG, JSON.parse(local));
+            if (!cfg) {
+                const local = localStorage.getItem(STORAGE_KEY);
+                if (local) cfg = Object.assign({}, DEFAULT_CONFIG, JSON.parse(local));
+            }
         } catch (e) {
             console.warn('[Threads Filter] 讀取設定失敗，使用預設值', e);
         }
-        return Object.assign({}, DEFAULT_CONFIG);
+        cfg = cfg || Object.assign({}, DEFAULT_CONFIG);
+
+        // v1.8.0 的舊開關：關掉過的維持關閉
+        if ('filterScamAccounts' in cfg) {
+            if (cfg.filterScamAccounts === false) cfg.scamMode = 'off';
+            delete cfg.filterScamAccounts;
+        }
+        return cfg;
     }
 
     function saveConfig(cfg) {
@@ -121,25 +131,39 @@
     const TAIWAN_REGEX = /🇹🇼|台灣|臺灣|Taiwan/i;
 
     /**
-     * 新帳號且地區不是台灣，視為詐騙帳號
+     * 新帳號且地區不是台灣，視為詐騙帳號；是的話回傳地區文字（例「🇲🇾 馬來西亞」），否則回傳 null
      */
-    function isScamAccount(postEl) {
+    function getScamLabel(postEl) {
         const text = postEl.textContent || '';
-        if (!text.includes(NEW_ACCOUNT_TAG)) return false;
+        if (!text.includes(NEW_ACCOUNT_TAG)) return null;
 
         const m = text.match(NEW_ACCOUNT_LABEL_REGEX);
-        if (!m) return false;
+        if (!m) return null;
 
         // 有國旗就只看國旗；地區名前面可能黏著貼文其他文字，不可靠
-        if (m[1]) return m[1] !== '🇹🇼';
-        return !TAIWAN_REGEX.test(m[2]);
+        const isScam = m[1] ? m[1] !== '🇹🇼' : !TAIWAN_REGEX.test(m[2]);
+        if (!isScam) return null;
+
+        return m[1] ? `${m[1]} ${m[2].trim()}`.trim() : '非台灣地區';
+    }
+
+    function addScamWarning(postEl, label) {
+        postEl.dataset.threadsScamWarned = 'true';
+        postEl.style.outline = '2px solid #ef4444';
+        postEl.style.outlineOffset = '-2px';
+
+        const banner = document.createElement('div');
+        banner.className = 'threads-scam-warning';
+        banner.textContent = `⚠️ 疑似詐騙帳號：${label}新帳號。小心私訊、投資、交友、代購邀約。`;
+        banner.setAttribute('style', 'background:#ef4444;color:#fff;font-size:13px;font-weight:600;padding:6px 12px;line-height:1.4;');
+        postEl.prepend(banner);
     }
 
     /**
      * 判斷貼文是否該隱藏；要隱藏回傳原因字串，否則回傳 null
      */
     function getHideReason(postEl, rawText) {
-        if (config.filterScamAccounts && isScamAccount(postEl)) {
+        if (config.scamMode === 'hide' && getScamLabel(postEl)) {
             return '詐騙帳號';
         }
 
@@ -249,7 +273,8 @@
             const state = post.dataset.threadsFiltered;
             if (state === 'hidden') return;
             // 帳號地區標籤是事後才補到貼文上的，已放行的貼文要再查一次
-            if (state === 'kept' && !(config.filterScamAccounts && isScamAccount(post))) return;
+            if (state === 'kept' &&
+                !(config.scamMode !== 'off' && !post.dataset.threadsScamWarned && getScamLabel(post))) return;
 
             const contentText = extractPostText(post);
             const info = getPostInfo(post);
@@ -274,6 +299,9 @@
                     });
                     panelDirty = true;
                 }
+            } else if (config.scamMode === 'warn' && !post.dataset.threadsScamWarned) {
+                const scamLabel = getScamLabel(post);
+                if (scamLabel) addScamWarning(post, scamLabel);
             }
 
             post.dataset.threadsFiltered = reason ? 'hidden' : 'kept';
@@ -1059,10 +1087,12 @@
             }
         );
 
+        const SCAM_MODE_LABELS = { warn: '⚠️ [紅框提醒]', hide: '🚫 [直接隱藏]', off: '❌ [不處理]' };
+        const SCAM_MODE_NEXT = { warn: 'hide', hide: 'off', off: 'warn' };
         GM_registerMenuCommand(
-            config.filterScamAccounts ? '✅ 非台灣新帳號（詐騙）：[隱藏]（點擊切換）' : '❌ 非台灣新帳號（詐騙）：[保留]（點擊切換）',
+            `非台灣新帳號（詐騙）：${SCAM_MODE_LABELS[config.scamMode] || SCAM_MODE_LABELS.warn}（點擊切換）`,
             () => {
-                config.filterScamAccounts = !config.filterScamAccounts;
+                config.scamMode = SCAM_MODE_NEXT[config.scamMode] || 'warn';
                 saveConfig(config);
                 location.reload();
             }
