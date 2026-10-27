@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.10.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
+// @version      1.11.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -11,6 +11,9 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_download
+// @connect      cdninstagram.com
+// @connect      fbcdn.net
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/charles0506/threads-chinese-filter/main/threads-chinese-filter.user.js
 // @updateURL    https://raw.githubusercontent.com/charles0506/threads-chinese-filter/main/threads-chinese-filter.user.js
@@ -164,8 +167,11 @@
      * 貼文是否帶圖片或影片（排除作者大頭貼）
      */
     function hasMedia(postEl) {
-        if (postEl.querySelector('video')) return true;
-        return Array.from(postEl.querySelectorAll('img')).some((img) =>
+        return postEl.querySelector('video') !== null || getMediaImages(postEl).length > 0;
+    }
+
+    function getMediaImages(postEl) {
+        return Array.from(postEl.querySelectorAll('img')).filter((img) =>
             !img.closest('a[href^="/@"]') && !/大頭貼|profile picture/i.test(img.alt || ''));
     }
 
@@ -566,6 +572,139 @@
         });
 
         panelEl.appendChild(list);
+    }
+
+    // ==========================================
+    // 4-2. 貼文圖片/影片下載
+    // ==========================================
+    const DL_BTN_STYLE = 'display:inline-flex;align-items:center;gap:4px;margin:6px 12px 8px;padding:4px 12px;border-radius:9999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-size:12px;cursor:pointer;';
+
+    function addDownloadButtons() {
+        getTopLevelPostElements().forEach((post) => {
+            if (post.dataset.threadsDl || post.dataset.threadsHidden) return;
+            if (!hasMedia(post)) return;
+
+            post.dataset.threadsDl = 'true';
+
+            const btn = document.createElement('button');
+            btn.className = 'threads-dl-btn';
+            btn.textContent = '⬇ 下載圖片/影片';
+            btn.title = '下載這則貼文的所有圖片與影片（原始解析度）';
+            btn.setAttribute('style', DL_BTN_STYLE);
+
+            // 貼文整塊可點擊會跳到貼文頁，按鈕上的事件不能往上傳
+            ['pointerdown', 'mousedown', 'mouseup', 'pointerup'].forEach((type) => {
+                btn.addEventListener(type, (e) => e.stopPropagation());
+            });
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                downloadPostMedia(post, btn);
+            });
+
+            post.appendChild(btn);
+        });
+    }
+
+    /**
+     * 從 srcset 挑寬度最大的版本，沒有 srcset 就用 src
+     */
+    function getBestImageUrl(img) {
+        const srcset = img.getAttribute('srcset');
+        if (srcset) {
+            let best = null;
+            let bestWidth = -1;
+            srcset.split(',').forEach((part) => {
+                const [url, size] = part.trim().split(/\s+/);
+                const width = parseInt(size, 10) || 0;
+                if (url && width > bestWidth) {
+                    best = url;
+                    bestWidth = width;
+                }
+            });
+            if (best) return best;
+        }
+        return img.currentSrc || img.src;
+    }
+
+    function getVideoUrl(video) {
+        const source = video.querySelector('source[src]');
+        return video.currentSrc || video.src || (source ? source.src : '');
+    }
+
+    function getExtension(url, fallback) {
+        try {
+            const m = new URL(url).pathname.match(/\.(jpe?g|png|webp|gif|heic|mp4|mov|webm)$/i);
+            if (m) return m[1].toLowerCase();
+        } catch (e) { /* 網址解析失敗就用預設副檔名 */ }
+        return fallback;
+    }
+
+    function downloadFile(url, name) {
+        return new Promise((resolve) => {
+            if (typeof GM_download !== 'function') {
+                window.open(url, '_blank', 'noopener');
+                resolve(false);
+                return;
+            }
+            GM_download({
+                url,
+                name,
+                onload: () => resolve(true),
+                onerror: (err) => {
+                    console.warn('[Threads Filter] 下載失敗，改開新分頁', name, err);
+                    window.open(url, '_blank', 'noopener');
+                    resolve(false);
+                },
+                ontimeout: () => resolve(false)
+            });
+        });
+    }
+
+    async function downloadPostMedia(post, btn) {
+        const info = getPostInfo(post);
+        const postId = (info.href.match(/\/post\/([^/?#]+)/) || [])[1] || Date.now().toString(36);
+        const prefix = `threads_${info.author || 'unknown'}_${postId}`;
+
+        const items = [];
+        const seen = new Set();
+        const add = (url, fallbackExt) => {
+            if (!url || seen.has(url)) return;
+            seen.add(url);
+            items.push({ url, ext: getExtension(url, fallbackExt) });
+        };
+
+        let blobVideos = 0;
+        post.querySelectorAll('video').forEach((video) => {
+            const url = getVideoUrl(video);
+            // blob: 是串流切片組出來的，拿不到完整檔案
+            if (url.startsWith('blob:')) {
+                blobVideos++;
+                return;
+            }
+            add(url, 'mp4');
+        });
+        getMediaImages(post).forEach((img) => add(getBestImageUrl(img), 'jpg'));
+
+        if (items.length === 0) {
+            btn.textContent = blobVideos ? '⚠ 這支影片是串流格式，無法下載' : '⚠ 找不到可下載的檔案';
+            return;
+        }
+
+        btn.disabled = true;
+        let ok = 0;
+        for (let i = 0; i < items.length; i++) {
+            btn.textContent = `⬇ 下載中 ${i + 1}/${items.length}…`;
+            const suffix = items.length > 1 ? `_${i + 1}` : '';
+            if (await downloadFile(items[i].url, `${prefix}${suffix}.${items[i].ext}`)) ok++;
+        }
+        btn.disabled = false;
+
+        const failed = items.length - ok;
+        let msg = `✓ 已下載 ${ok} 個檔案`;
+        if (failed) msg += `，${failed} 個改開新分頁`;
+        if (blobVideos) msg += `，${blobVideos} 支串流影片無法下載`;
+        btn.textContent = msg;
     }
 
     // ==========================================
@@ -1142,6 +1281,7 @@
             scheduled = true;
             requestAnimationFrame(() => {
                 processFeed();
+                addDownloadButtons();
                 checkActiveImageLifecycle();
                 scheduled = false;
             });
@@ -1152,6 +1292,7 @@
         createBadge();
         registerMenuCommands();
         processFeed();
+        addDownloadButtons();
         checkActiveImageLifecycle();
 
         const observer = new MutationObserver((mutations) => {
