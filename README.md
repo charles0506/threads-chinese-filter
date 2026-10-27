@@ -7,7 +7,7 @@
    - 首頁動態牆滑動看貼文完全不干涉。
    - 點開圖片時：**滾輪往上滾放大**；原始大小**往下滾直接保留 Threads 原生「下滑關閉」手勢**！兩個功能完美共存，絕不衝突！
 
-![版本](https://img.shields.io/badge/version-1.11.1-blue)
+![版本](https://img.shields.io/badge/version-1.11.2-blue)
 ![授權](https://img.shields.io/badge/license-MIT-green)
 
 ---

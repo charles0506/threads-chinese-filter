@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.11.1
+// @version      1.11.2
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -178,8 +178,23 @@
     }
 
     function getMediaImages(postEl) {
-        return Array.from(postEl.querySelectorAll('img')).filter((img) =>
-            !img.closest('a[href^="/@"]') && !/大頭貼|profile picture/i.test(img.alt || ''));
+        return Array.from(postEl.querySelectorAll('img')).filter(isMediaImage);
+    }
+
+    /**
+     * 貼文內容圖片：排除大頭貼與地區國旗、話題圖示這類小圖
+     */
+    function isMediaImage(img) {
+        if (/大頭貼|profile picture/i.test(img.alt || '')) return false;
+
+        // 作者連結 /@user 裡的是大頭貼；貼文連結 /@user/post/... 裡的是內容圖片
+        const link = img.closest('a[href^="/@"]');
+        if (link && !link.getAttribute('href').includes('/post/')) return false;
+
+        // 影片的封面縮圖跟 <video> 同一層，下載影片就好
+        if (img.parentElement && img.parentElement.querySelector('video')) return false;
+
+        return img.hasAttribute('srcset') || img.width >= 100 || img.height >= 100 || img.naturalWidth >= 150;
     }
 
     /**
@@ -1316,6 +1331,11 @@
         });
 
         observer.observe(document.body, { childList: true, subtree: true });
+
+        // 延遲載入的圖片載完才有尺寸，但不會觸發 DOM 變動，要另外補一次掃描
+        document.addEventListener('load', (e) => {
+            if (e.target.tagName === 'IMG') scheduleProcess();
+        }, true);
     }
 
     if (document.readyState === 'loading') {
