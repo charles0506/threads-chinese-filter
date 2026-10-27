@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.9.1
+// @version      1.10.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -34,7 +34,8 @@
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
         enableImageZoom: true,      // 是否啟用圖片縮放功能 (點開燈箱後生效)
-        scamMode: 'warn'            // 非台灣新帳號貼文：'warn' 加紅框提醒 / 'hide' 直接隱藏 / 'off' 不處理
+        scamMode: 'warn',           // 非台灣新帳號貼文：'warn' 加紅框提醒 / 'hide' 直接隱藏 / 'off' 不處理
+        keepMediaPosts: true        // 有圖片或影片的貼文一律不做語言過濾
     };
 
     function loadConfig() {
@@ -160,11 +161,24 @@
     }
 
     /**
+     * 貼文是否帶圖片或影片（排除作者大頭貼）
+     */
+    function hasMedia(postEl) {
+        if (postEl.querySelector('video')) return true;
+        return Array.from(postEl.querySelectorAll('img')).some((img) =>
+            !img.closest('a[href^="/@"]') && !/大頭貼|profile picture/i.test(img.alt || ''));
+    }
+
+    /**
      * 判斷貼文是否該隱藏；要隱藏回傳原因字串，否則回傳 null
      */
     function getHideReason(postEl, rawText) {
         if (config.scamMode === 'hide' && getScamLabel(postEl)) {
             return '詐騙帳號';
+        }
+
+        if (config.keepMediaPosts && hasMedia(postEl)) {
+            return null;
         }
 
         if (config.filterTranslationPosts && hasTranslationTrigger(postEl)) {
@@ -1089,7 +1103,16 @@
             }
         );
 
-        const SCAM_MODE_LABELS = { warn: '⚠️ [紅框提醒]', hide: '🚫 [直接隱藏]', off: '❌ [不處理]' };
+        GM_registerMenuCommand(
+            config.keepMediaPosts ? '🖼️ 圖片/影片貼文：[一律保留]（點擊切換）' : '🖼️ 圖片/影片貼文：[照常過濾]（點擊切換）',
+            () => {
+                config.keepMediaPosts = !config.keepMediaPosts;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        const SCAM_MODE_LABELS ={ warn: '⚠️ [紅框提醒]', hide: '🚫 [直接隱藏]', off: '❌ [不處理]' };
         const SCAM_MODE_NEXT = { warn: 'hide', hide: 'off', off: 'warn' };
         GM_registerMenuCommand(
             `非台灣新帳號（詐騙）：${SCAM_MODE_LABELS[config.scamMode] || SCAM_MODE_LABELS.warn}（點擊切換）`,
