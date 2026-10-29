@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.17.0
+// @version      1.18.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -51,6 +51,8 @@
         dislikedPosts: [],          // 🚫 單則隱藏的貼文（貼文網址）
         aiPreference: true,         // 🧠 用 Chrome 內建 Gemini Nano 學你的喜好，藏掉相似貼文
         dislikeExamples: [],        // 🧠 你不喜歡的貼文內文（AI 的反例）
+        dislikeReasons: {},         // 🧠 反例內文 -> 你填的不喜歡原因
+        dislikeTopics: '',          // 🧠 你直接告訴 AI 不想看的主題
         keepExamples: []            // 🧠 被 AI 誤藏、你還原的貼文內文（AI 的正例）
     };
 
@@ -74,6 +76,8 @@
         ['blockedAuthors', 'blockedKeywords', 'dislikedPosts', 'dislikeExamples', 'keepExamples'].forEach((k) => {
             cfg[k] = Array.isArray(cfg[k]) ? cfg[k].slice() : [];
         });
+        cfg.dislikeReasons = Object.assign({}, cfg.dislikeReasons);
+        cfg.dislikeTopics = typeof cfg.dislikeTopics === 'string' ? cfg.dislikeTopics : '';
 
         // v1.8.0 的舊開關：關掉過的維持關閉
         if ('filterScamAccounts' in cfg) {
@@ -577,6 +581,15 @@
         return null;
     }
 
+    let prefVersion = 0;               // 例子或原因每變一次 +1，用來判斷建好的 session 是否已過時
+
+    /**
+     * 有足夠的不喜歡例子，或使用者直接寫了不想看的主題，就能開始判斷
+     */
+    function hasPrefSignal() {
+        return config.dislikeExamples.length >= PREF_MIN_EXAMPLES || config.dislikeTopics.trim() !== '';
+    }
+
     function setPrefStatus(status) {
         prefStatus = status;
         panelDirty = true;
@@ -591,7 +604,7 @@
     async function initPrefModel() {
         if (!config.aiPreference) return;
         if (hasCloudAi()) {
-            setPrefStatus(config.dislikeExamples.length < PREF_MIN_EXAMPLES ? 'need-examples' : 'ready');
+            setPrefStatus(hasPrefSignal() ? 'ready' : 'need-examples');
             return;
         }
         const api = getLanguageModelApi();
@@ -618,16 +631,22 @@
 
     function buildPrefPrompt(batch) {
         const clip = (t) => t.replace(/\s+/g, ' ').slice(0, PREF_EXAMPLE_CHARS);
-        const dislikes = config.dislikeExamples.map((t, i) => `D${i + 1}: ${clip(t)}`).join('\n');
+        const dislikes = config.dislikeExamples.map((t, i) => {
+            const why = config.dislikeReasons[t];
+            return `D${i + 1}: ${clip(t)}` + (why ? `\n    (user's reason: ${why})` : '');
+        }).join('\n') || '(none)';
         const keeps = config.keepExamples.map((t, i) => `K${i + 1}: ${clip(t)}`).join('\n') || '(none)';
+        const topics = config.dislikeTopics.trim();
+        const target = topics ? 'clearly about the unwanted topics or clearly similar to the disliked posts' : 'clearly similar to the disliked posts';
         const answerRule = batch
             ? ['You will get several numbered posts. Answer only JSON {"hide": [numbers]} listing the posts that are',
-               'clearly similar to the disliked posts. When unsure about a post, leave it out. Answer {"hide": []} if none.']
-            : ['For each new post, answer only JSON {"hide": true} if it is clearly similar to the disliked posts,',
+               `${target}. When unsure about a post, leave it out. Answer {"hide": []} if none.`]
+            : [`For each new post, answer only JSON {"hide": true} if it is ${target},`,
                'otherwise {"hide": false}. When unsure, answer {"hide": false}.'];
         return [
             'You filter a Threads social media feed for one user. Posts are mostly in Traditional Chinese.',
-            'Posts the user DISLIKED (hide posts similar to these in topic, intent or style):',
+            ...(topics ? ['Topics the user said they do NOT want to see (most important rule):', topics] : []),
+            'Posts the user DISLIKED (hide posts similar to these; when a reason is given, judge by that reason, not by other details of the post):',
             dislikes,
             'Posts the user wants to KEEP (never hide posts like these):',
             keeps,
@@ -639,7 +658,7 @@
         if (hasCloudAi()) {
             // 雲端模式不用建 session，每次請求都帶最新的例子
             prefBaseDirty = false;
-            setPrefStatus(config.dislikeExamples.length < PREF_MIN_EXAMPLES ? 'need-examples' : 'ready');
+            setPrefStatus(hasPrefSignal() ? 'ready' : 'need-examples');
             runPrefQueue();
             return null;
         }
@@ -647,13 +666,14 @@
         const api = getLanguageModelApi();
         if (!api) return null;
         // 例子不夠先不建模型；第 3 次按「不喜歡」時（使用者點擊中）再建，順便觸發下載
-        if (config.dislikeExamples.length < PREF_MIN_EXAMPLES) {
+        if (!hasPrefSignal()) {
             setPrefStatus('need-examples');
             return null;
         }
 
         if (prefStatus !== 'ready') setPrefStatus('downloading');
         const old = prefBase;
+        const version = prefVersion;
         prefCreating = api.create(Object.assign({}, PREF_MODEL_OPTIONS, {
             initialPrompts: [{ role: 'system', content: buildPrefPrompt() }],
             monitor(m) {
@@ -664,39 +684,60 @@
             }
         })).then((session) => {
             prefBase = session;
-            prefBaseDirty = false;
             if (old) old.destroy();
             setPrefStatus('ready');
-            runPrefQueue();
+            // 建立期間例子或原因又變了，用最新內容再建一次
+            prefBaseDirty = version !== prefVersion;
+            prefCreating = null;
+            if (prefBaseDirty) buildPrefBase();
+            else runPrefQueue();
         }).catch((e) => {
             console.warn('[Threads Filter] AI 喜好過濾模型建立失敗', e);
             setPrefStatus('error');
-        }).finally(() => {
             prefCreating = null;
         });
         return prefCreating;
     }
 
-    function addPrefExample(listName, text) {
-        const t = (text || '').trim();
-        if (t.length < PREF_MIN_CHARS) return;
-        const max = listName === 'dislikeExamples' ? PREF_MAX_DISLIKES : PREF_MAX_KEEPS;
-        const list = config[listName].filter((x) => x !== t);
-        list.push(t);
-        while (list.length > max) list.shift();
-        config[listName] = list;
-        saveConfig(config);
+    function markPrefChanged() {
+        prefVersion++;
         prefBaseDirty = true;
-
         // 例子變了就重建；第一次湊滿例子也從這裡開始（此時在使用者點擊中，可觸發模型下載）
         if (config.aiPreference && !['idle', 'unsupported'].includes(prefStatus)) buildPrefBase();
         panelDirty = true;
         updateBadge();
     }
 
+    function addPrefExample(listName, text) {
+        const t = (text || '').trim();
+        if (t.length < PREF_MIN_CHARS) return '';
+        const max = listName === 'dislikeExamples' ? PREF_MAX_DISLIKES : PREF_MAX_KEEPS;
+        const list = config[listName].filter((x) => x !== t);
+        list.push(t);
+        while (list.length > max) list.shift();
+        config[listName] = list;
+        if (listName === 'dislikeExamples') {
+            // 被擠掉的例子，原因也一起清
+            Object.keys(config.dislikeReasons).forEach((k) => {
+                if (!list.includes(k)) delete config.dislikeReasons[k];
+            });
+        }
+        saveConfig(config);
+        markPrefChanged();
+        return t;
+    }
+
+    function setDislikeReason(example, reason) {
+        const why = (reason || '').trim().slice(0, 60);
+        if (!example || !why || !config.dislikeExamples.includes(example)) return;
+        config.dislikeReasons[example] = why;
+        saveConfig(config);
+        markPrefChanged();
+    }
+
     function queuePrefCheck(post, key, info, contentText) {
         if (!config.aiPreference || post.dataset.threadsPrefChecked) return;
-        if (config.dislikeExamples.length < PREF_MIN_EXAMPLES) return;
+        if (!hasPrefSignal()) return;
         const text = cleanPostContent(contentText);
         if (text.length < PREF_MIN_CHARS) return;
 
@@ -932,7 +973,7 @@
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     async function runCloudQueue() {
-        if (prefRunning || prefStatus === 'bad-key' || config.dislikeExamples.length < PREF_MIN_EXAMPLES) return;
+        if (prefRunning || prefStatus === 'bad-key' || !hasPrefSignal()) return;
         prefRunning = true;
         try {
             while (prefQueue.length > 0) {
@@ -1028,18 +1069,25 @@
         location.reload();
     }
 
+    function getPrefLearnedText() {
+        const reasons = config.dislikeExamples.filter((t) => config.dislikeReasons[t]).length;
+        const topics = config.dislikeTopics.trim();
+        return `已學 ${config.dislikeExamples.length} 則不喜歡（${reasons} 則有原因）` +
+            (topics ? `・不想看：${topics.length > 20 ? topics.slice(0, 20) + '…' : topics}` : '');
+    }
+
     function getPrefStatusText() {
         if (!config.aiPreference) return '🧠 喜好 AI：已關閉（竄改猴選單可開啟）';
         if (hasCloudAi()) {
             const name = cloudName();
             switch (prefStatus) {
                 case 'need-examples':
-                    return `🧠 喜好 AI（${name}）：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」就開始學習`;
+                    return `🧠 喜好 AI（${name}）：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」，或從竄改猴選單寫「不想看的主題」就開始`;
                 case 'quota': return `🧠 喜好 AI（${name}）：額度或速度上限，1 分鐘後重試・排隊 ${prefQueue.length}（OpenAI 也可能是沒儲值）`;
                 case 'bad-key': return `🧠 喜好 AI（${name}）：API 金鑰無效，請從竄改猴選單重新設定`;
                 case 'error': return `🧠 喜好 AI（${name}）：請求失敗（詳見主控台），下一批會再試`;
                 case 'ready':
-                    return `🧠 喜好 AI（${name}${cloudModel ? ' ' + cloudModel : ''}）：運作中・已學 ${config.dislikeExamples.length} 則不喜歡・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
+                    return `🧠 喜好 AI（${name}${cloudModel ? ' ' + cloudModel : ''}）：運作中・${getPrefLearnedText()}・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
                         (prefQueue.length ? `・排隊 ${prefQueue.length}` : '');
                 default: return `🧠 喜好 AI（${name}）：檢查中…`;
             }
@@ -1050,9 +1098,9 @@
             case 'downloading': return `🧠 喜好 AI：模型下載中 ${prefProgress}%…`;
             case 'error': return '🧠 喜好 AI：啟動失敗（詳見主控台）';
             case 'need-examples':
-                return `🧠 喜好 AI：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」就開始學習`;
+                return `🧠 喜好 AI：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」，或從竄改猴選單寫「不想看的主題」就開始`;
             case 'ready':
-                return `🧠 喜好 AI：運作中・已學 ${config.dislikeExamples.length} 則不喜歡・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
+                return `🧠 喜好 AI：運作中・${getPrefLearnedText()}・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
                     (prefQueue.length ? `・排隊 ${prefQueue.length}` : '');
             default: return '🧠 喜好 AI：檢查中…';
         }
@@ -1455,8 +1503,12 @@
             }
             const text = extractPostText(post);
             hidePost(post, key, info, text, '不喜歡');
-            addPrefExample('dislikeExamples', cleanPostContent(text));
+            // 先記例子（在點擊當下才能觸發模型下載），再問原因
+            const example = addPrefExample('dislikeExamples', cleanPostContent(text));
             updateBadge();
+            if (example && config.aiPreference) {
+                setDislikeReason(example, window.prompt('為什麼不喜歡這則？（可留空，例：業配、政治、炫富）\nAI 會照原因找相似貼文，不會亂猜。', ''));
+            }
         }));
 
         if (info.author) {
@@ -2182,10 +2234,25 @@
         );
 
         GM_registerMenuCommand(
+            config.dislikeTopics.trim() ? `📝 不想看的主題：[${config.dislikeTopics.trim().slice(0, 20)}]（點擊修改）` : '📝 設定不想看的主題（告訴喜好 AI）…',
+            () => {
+                const v = window.prompt(
+                    '寫下你不想看的內容，喜好 AI 每次判斷都會參考（留空＝清除）。\n例：政治口水、業配團購、炫富、星座運勢、情緒勒索文',
+                    config.dislikeTopics
+                );
+                if (v === null) return;
+                config.dislikeTopics = v.trim().slice(0, 300);
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        GM_registerMenuCommand(
             `🧠 清除喜好 AI 學到的例子（目前 ${config.dislikeExamples.length} 則不喜歡、${config.keepExamples.length} 則保留）`,
             () => {
-                if (!window.confirm('清除喜好 AI 學到的所有例子？')) return;
+                if (!window.confirm('清除喜好 AI 學到的所有例子？（不想看的主題會保留）')) return;
                 config.dislikeExamples = [];
+                config.dislikeReasons = {};
                 config.keepExamples = [];
                 saveConfig(config);
                 location.reload();
