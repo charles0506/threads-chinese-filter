@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.11.3
+// @version      1.12.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -12,6 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_download
+// @grant        unsafeWindow
 // @connect      cdninstagram.com
 // @connect      fbcdn.net
 // @run-at       document-idle
@@ -38,7 +39,8 @@
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
         enableImageZoom: true,      // 是否啟用圖片縮放功能 (點開燈箱後生效)
         scamMode: 'warn',           // 非台灣新帳號貼文：'warn' 加紅框提醒 / 'hide' 直接隱藏 / 'off' 不處理
-        keepMediaPosts: true        // 有圖片或影片的貼文一律不做語言過濾
+        keepMediaPosts: true,       // 有圖片或影片的貼文一律不做語言過濾
+        aiLanguageDetect: true      // 用 Chrome 內建 AI 語言偵測複查規則放行的貼文
     };
 
     function loadConfig() {
@@ -337,31 +339,171 @@
             const reason = restoredKeys.has(key) ? null : getHideReason(post, contentText);
 
             if (reason) {
-                post.style.display = 'none';
-                post.dataset.threadsHidden = 'true';
-
-                const existing = hiddenPosts.get(key);
-                if (existing) {
-                    existing.el = post;
-                } else {
-                    hiddenPosts.set(key, {
-                        el: post,
-                        author: info.author,
-                        href: info.href,
-                        text: contentText.trim(),
-                        reason
-                    });
-                    panelDirty = true;
+                hidePost(post, key, info, contentText, reason);
+            } else {
+                if (config.scamMode === 'warn' && !post.dataset.threadsScamWarned) {
+                    const scamLabel = getScamLabel(post);
+                    if (scamLabel) addScamWarning(post, scamLabel);
                 }
-            } else if (config.scamMode === 'warn' && !post.dataset.threadsScamWarned) {
-                const scamLabel = getScamLabel(post);
-                if (scamLabel) addScamWarning(post, scamLabel);
+                if (!restoredKeys.has(key)) queueAiLanguageCheck(post, key, info, contentText);
             }
 
             post.dataset.threadsFiltered = reason ? 'hidden' : 'kept';
         });
 
         updateBadge();
+    }
+
+    function hidePost(post, key, info, contentText, reason) {
+        post.style.display = 'none';
+        post.dataset.threadsHidden = 'true';
+        post.dataset.threadsFiltered = 'hidden';
+
+        const existing = hiddenPosts.get(key);
+        if (existing) {
+            existing.el = post;
+        } else {
+            hiddenPosts.set(key, {
+                el: post,
+                author: info.author,
+                href: info.href,
+                text: contentText.trim(),
+                reason
+            });
+            panelDirty = true;
+        }
+    }
+
+    // ==========================================
+    // 3-1. AI 語言偵測 (Chrome 內建 LanguageDetector，模型在本機跑、免費)
+    // 規則放行的貼文再交給 AI 複查；Firefox 沒有這個 API，會自動略過
+    // ==========================================
+    const AI_MIN_LETTERS = 8;          // 字太少 AI 也判不準，不送
+    const AI_MIN_CONFIDENCE = 0.7;     // 信心度低於這個就不動
+    let aiStatus = 'idle';             // idle / unsupported / need-click / downloading / ready / error
+    let aiDetector = null;
+    let aiCreating = null;
+    const aiQueue = [];
+    let aiRunning = false;
+    const langNames = (() => {
+        try { return new Intl.DisplayNames(['zh-TW'], { type: 'language' }); } catch (e) { return null; }
+    })();
+
+    function getLanguageDetectorApi() {
+        if (typeof LanguageDetector !== 'undefined') return LanguageDetector;
+        if (typeof unsafeWindow !== 'undefined' && unsafeWindow.LanguageDetector) return unsafeWindow.LanguageDetector;
+        return null;
+    }
+
+    function setAiStatus(status) {
+        if (aiStatus === status) return;
+        aiStatus = status;
+        panelDirty = true;
+        updateBadge();
+    }
+
+    async function initAiDetector() {
+        if (!config.aiLanguageDetect) return;
+        const api = getLanguageDetectorApi();
+        if (!api) {
+            setAiStatus('unsupported');
+            return;
+        }
+        try {
+            const availability = await api.availability();
+            if (availability === 'unavailable') {
+                setAiStatus('unsupported');
+            } else if (availability === 'available') {
+                await createAiDetector();
+            } else {
+                // 模型要下載時，Chrome 規定必須由使用者點擊觸發
+                setAiStatus('need-click');
+                document.addEventListener('pointerdown', createAiDetector, { capture: true, once: true });
+            }
+        } catch (e) {
+            console.warn('[Threads Filter] AI 語言偵測初始化失敗', e);
+            setAiStatus('error');
+        }
+    }
+
+    function createAiDetector() {
+        if (aiDetector || aiCreating) return aiCreating;
+        const api = getLanguageDetectorApi();
+        if (!api) return null;
+
+        setAiStatus('downloading');
+        aiCreating = api.create({
+            monitor(m) {
+                m.addEventListener('downloadprogress', () => setAiStatus('downloading'));
+            }
+        }).then((detector) => {
+            aiDetector = detector;
+            setAiStatus('ready');
+            // 模型準備好之前已放行的貼文補查一次
+            document.querySelectorAll('[data-threads-filtered="kept"]').forEach((el) => {
+                delete el.dataset.threadsFiltered;
+                delete el.dataset.threadsAiChecked;
+            });
+            scheduleProcess();
+        }).catch((e) => {
+            console.warn('[Threads Filter] AI 語言偵測模型建立失敗', e);
+            setAiStatus('error');
+        }).finally(() => {
+            aiCreating = null;
+        });
+        return aiCreating;
+    }
+
+    function queueAiLanguageCheck(post, key, info, contentText) {
+        if (!config.aiLanguageDetect || !aiDetector || post.dataset.threadsAiChecked) return;
+
+        const cleanText = cleanPostContent(contentText);
+        post.dataset.threadsAiChecked = 'true';
+
+        const letterCount = countMatches(cleanText, /\p{L}/gu);
+        if (letterCount < AI_MIN_LETTERS) return;
+        // 短說明的圖片貼文照規則保留，不讓 AI 推翻
+        if (config.keepMediaPosts && letterCount <= MEDIA_CAPTION_MAX_LETTERS && hasMedia(post)) return;
+        // 明顯是中文的貼文不送，避免中英夾雜被 AI 誤判成英文
+        const hanCount = countMatches(cleanText, CJK_UNIFIED_REGEX);
+        if (hanCount >= 4 && hanCount >= countMatches(cleanText, /[a-zA-ZÀ-ɏ]+/g)) return;
+
+        aiQueue.push({ post, key, info, contentText, cleanText });
+        runAiQueue();
+    }
+
+    async function runAiQueue() {
+        if (aiRunning) return;
+        aiRunning = true;
+        while (aiQueue.length > 0) {
+            const job = aiQueue.shift();
+            if (!config.enabled || !job.post.isConnected || restoredKeys.has(job.key)) continue;
+            try {
+                const results = await aiDetector.detect(job.cleanText);
+                const top = results && results[0];
+                if (top && top.detectedLanguage !== 'und' && !top.detectedLanguage.startsWith('zh') &&
+                    top.confidence >= AI_MIN_CONFIDENCE) {
+                    const name = (langNames && langNames.of(top.detectedLanguage)) || top.detectedLanguage;
+                    hidePost(job.post, job.key, job.info, job.contentText, `AI：${name}`);
+                    updateBadge();
+                }
+            } catch (e) {
+                console.warn('[Threads Filter] AI 語言偵測失敗', e);
+            }
+        }
+        aiRunning = false;
+    }
+
+    function getAiStatusText() {
+        if (!config.aiLanguageDetect) return 'AI 語言偵測：已關閉（竄改猴選單可開啟）';
+        switch (aiStatus) {
+            case 'unsupported': return 'AI 語言偵測：此瀏覽器不支援（需 Chrome 138 以上）';
+            case 'need-click': return 'AI 語言偵測：點一下頁面任意處開始下載模型';
+            case 'downloading': return 'AI 語言偵測：模型下載中…';
+            case 'ready': return 'AI 語言偵測：已啟用';
+            case 'error': return 'AI 語言偵測：啟動失敗（詳見主控台）';
+            default: return 'AI 語言偵測：檢查中…';
+        }
     }
 
     function getPostInfo(postEl) {
@@ -551,6 +693,11 @@
         header.appendChild(makePanelButton(config.enabled ? '暫停過濾' : '恢復過濾', toggleEnabled));
         header.appendChild(makePanelButton('✕', togglePanel));
         panelEl.appendChild(header);
+
+        const aiLine = document.createElement('div');
+        aiLine.textContent = getAiStatusText();
+        aiLine.setAttribute('style', `padding:6px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.08);color:${aiStatus === 'ready' ? '#4ade80' : '#94a3b8'};`);
+        panelEl.appendChild(aiLine);
 
         const list = document.createElement('div');
         list.setAttribute('style', 'overflow-y:auto;flex:1;');
@@ -1275,6 +1422,15 @@
         );
 
         GM_registerMenuCommand(
+            config.aiLanguageDetect ? '🤖 AI 語言偵測：[開啟]（點擊切換）' : '🤖 AI 語言偵測：[關閉]（點擊切換）',
+            () => {
+                config.aiLanguageDetect = !config.aiLanguageDetect;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        GM_registerMenuCommand(
             config.keepMediaPosts ? '🖼️ 圖片/影片貼文：[一律保留]（點擊切換）' : '🖼️ 圖片/影片貼文：[照常過濾]（點擊切換）',
             () => {
                 config.keepMediaPosts = !config.keepMediaPosts;
@@ -1326,6 +1482,7 @@
         processFeed();
         addDownloadButtons();
         checkActiveImageLifecycle();
+        initAiDetector();
 
         const observer = new MutationObserver((mutations) => {
             let hasNodes = false;
