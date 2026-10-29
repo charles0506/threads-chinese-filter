@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.14.0
+// @version      1.15.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -13,6 +13,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_download
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      generativelanguage.googleapis.com
 // @connect      cdninstagram.com
 // @connect      fbcdn.net
 // @run-at       document-idle
@@ -522,8 +524,9 @@
     }
 
     // ==========================================
-    // 3-2. AI 學你的喜好 (Chrome 內建 Gemini Nano / Prompt API)
+    // 3-2. AI 學你的喜好
     // 你按「🚫 不喜歡」的貼文當反例、按「還原顯示」的 AI 誤判當正例，讓 AI 藏掉相似貼文
+    // 有設 Gemini API 金鑰就走 Google Gemini 雲端（Firefox / VM 都能用）；沒有就用 Chrome 內建 Gemini Nano
     // ==========================================
     const PREF_MIN_EXAMPLES = 3;       // 至少要有幾則不喜歡的例子才開始判斷
     const PREF_MAX_DISLIKES = 20;
@@ -559,6 +562,10 @@
 
     async function initPrefModel() {
         if (!config.aiPreference) return;
+        if (getGeminiKey()) {
+            setPrefStatus(config.dislikeExamples.length < PREF_MIN_EXAMPLES ? 'need-examples' : 'ready');
+            return;
+        }
         const api = getLanguageModelApi();
         if (!api) {
             setPrefStatus('unsupported');
@@ -581,22 +588,33 @@
         }
     }
 
-    function buildPrefPrompt() {
+    function buildPrefPrompt(batch) {
         const clip = (t) => t.replace(/\s+/g, ' ').slice(0, PREF_EXAMPLE_CHARS);
         const dislikes = config.dislikeExamples.map((t, i) => `D${i + 1}: ${clip(t)}`).join('\n');
         const keeps = config.keepExamples.map((t, i) => `K${i + 1}: ${clip(t)}`).join('\n') || '(none)';
+        const answerRule = batch
+            ? ['You will get several numbered posts. Answer only JSON {"hide": [numbers]} listing the posts that are',
+               'clearly similar to the disliked posts. When unsure about a post, leave it out. Answer {"hide": []} if none.']
+            : ['For each new post, answer only JSON {"hide": true} if it is clearly similar to the disliked posts,',
+               'otherwise {"hide": false}. When unsure, answer {"hide": false}.'];
         return [
             'You filter a Threads social media feed for one user. Posts are mostly in Traditional Chinese.',
             'Posts the user DISLIKED (hide posts similar to these in topic, intent or style):',
             dislikes,
             'Posts the user wants to KEEP (never hide posts like these):',
             keeps,
-            'For each new post, answer only JSON {"hide": true} if it is clearly similar to the disliked posts,',
-            'otherwise {"hide": false}. When unsure, answer {"hide": false}.'
+            ...answerRule
         ].join('\n');
     }
 
     function buildPrefBase() {
+        if (getGeminiKey()) {
+            // 雲端模式不用建 session，每次請求都帶最新的例子
+            prefBaseDirty = false;
+            setPrefStatus(config.dislikeExamples.length < PREF_MIN_EXAMPLES ? 'need-examples' : 'ready');
+            runPrefQueue();
+            return null;
+        }
         if (prefCreating) return prefCreating;
         const api = getLanguageModelApi();
         if (!api) return null;
@@ -660,6 +678,7 @@
     }
 
     async function runPrefQueue() {
+        if (getGeminiKey()) return runGeminiQueue();
         if (prefRunning || !prefBase || prefBaseDirty) return;
         prefRunning = true;
         while (prefQueue.length > 0 && prefBase && !prefBaseDirty) {
@@ -692,10 +711,175 @@
         prefRunning = false;
     }
 
+    // ------------------------------------------
+    // Gemini 雲端模式：一次送多則貼文，配合免費額度限速
+    // 金鑰只存在竄改猴的 GM 儲存區，不放 localStorage（Threads 網頁讀得到 localStorage）
+    // ------------------------------------------
+    const GEMINI_KEY_STORE = 'threads_filter_gemini_key';
+    const GEMINI_MODEL_STORE = 'threads_filter_gemini_model';
+    const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta/';
+    const GEMINI_BATCH = 10;           // 一次請求判斷幾則
+    const GEMINI_INTERVAL_MS = 6000;   // 兩次請求至少間隔，約每分鐘 10 次
+    const GEMINI_QUOTA_WAIT_MS = 60000;
+    let geminiNextAt = 0;
+    let geminiModel = '';
+
+    function getGeminiKey() {
+        try {
+            return typeof GM_getValue === 'function' ? (GM_getValue(GEMINI_KEY_STORE, '') || '') : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function geminiRequest(method, path, body) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method,
+                url: GEMINI_API + path,
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': getGeminiKey() },
+                data: body ? JSON.stringify(body) : undefined,
+                timeout: 30000,
+                onload: (res) => {
+                    let json = null;
+                    try { json = JSON.parse(res.responseText); } catch (e) { /* 非 JSON 回應 */ }
+                    if (res.status >= 200 && res.status < 300 && json) {
+                        resolve(json);
+                    } else {
+                        reject({ status: res.status, message: (json && json.error && json.error.message) || res.statusText });
+                    }
+                },
+                onerror: () => reject({ status: 0, message: '連線失敗' }),
+                ontimeout: () => reject({ status: 0, message: '逾時' })
+            });
+        });
+    }
+
+    /**
+     * 自動挑最新的 Flash-Lite 模型（免費額度最多），結果快取 7 天
+     */
+    async function resolveGeminiModel() {
+        if (geminiModel) return geminiModel;
+        const cached = GM_getValue(GEMINI_MODEL_STORE, null);
+        if (cached && cached.name && Date.now() - cached.at < 7 * 86400000) {
+            geminiModel = cached.name;
+            return geminiModel;
+        }
+
+        const res = await geminiRequest('GET', 'models?pageSize=1000');
+        const candidates = (res.models || [])
+            .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+            .map((m) => m.name.replace(/^models\//, ''))
+            .filter((n) => /flash-lite/.test(n) && !/tts|image|audio|live|embed/.test(n));
+        if (candidates.length === 0) throw { status: 0, message: '找不到可用的 Flash-Lite 模型' };
+
+        const score = (n) => {
+            const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '0');
+            return (n.includes('preview') ? 0 : 1000) + v * 10 - n.length / 1000;
+        };
+        candidates.sort((a, b) => score(b) - score(a));
+        geminiModel = candidates[0];
+        GM_setValue(GEMINI_MODEL_STORE, { name: geminiModel, at: Date.now() });
+        return geminiModel;
+    }
+
+    async function geminiJudge(texts) {
+        const model = await resolveGeminiModel();
+        const posts = texts.map((t, i) => `#${i + 1}: ${t.replace(/\s+/g, ' ').slice(0, 400)}`).join('\n\n');
+        const res = await geminiRequest('POST', `models/${model}:generateContent`, {
+            systemInstruction: { parts: [{ text: buildPrefPrompt(true) }] },
+            contents: [{ role: 'user', parts: [{ text: posts }] }],
+            generationConfig: {
+                temperature: 0,
+                responseMimeType: 'application/json',
+                responseSchema: {
+                    type: 'OBJECT',
+                    properties: { hide: { type: 'ARRAY', items: { type: 'INTEGER' } } },
+                    required: ['hide']
+                }
+            }
+        });
+        const text = res.candidates && res.candidates[0] && res.candidates[0].content &&
+            res.candidates[0].content.parts.map((p) => p.text || '').join('');
+        const parsed = JSON.parse(text || '{"hide":[]}');
+        return new Set((parsed.hide || []).map(Number));
+    }
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    async function runGeminiQueue() {
+        if (prefRunning || prefStatus === 'bad-key' || config.dislikeExamples.length < PREF_MIN_EXAMPLES) return;
+        prefRunning = true;
+        try {
+            while (prefQueue.length > 0) {
+                const wait = geminiNextAt - Date.now();
+                if (wait > 0) await sleep(wait);
+
+                const jobs = [];
+                while (prefQueue.length > 0 && jobs.length < GEMINI_BATCH) {
+                    const job = prefQueue.shift();
+                    if (config.enabled && job.post.isConnected && !job.post.dataset.threadsHidden && !restoredKeys.has(job.key)) {
+                        jobs.push(job);
+                    }
+                }
+                if (jobs.length === 0) continue;
+
+                geminiNextAt = Date.now() + GEMINI_INTERVAL_MS;
+                try {
+                    const hide = await geminiJudge(jobs.map((j) => j.text));
+                    prefStats.checked += jobs.length;
+                    jobs.forEach((job, i) => {
+                        if (hide.has(i + 1) && job.post.isConnected && !job.post.dataset.threadsHidden) {
+                            prefStats.hidden++;
+                            hidePost(job.post, job.key, job.info, job.contentText, PREF_REASON);
+                        }
+                    });
+                    if (prefStatus !== 'ready') setPrefStatus('ready');
+                } catch (e) {
+                    console.warn('[Threads Filter] Gemini 判斷失敗', e);
+                    if (e.status === 429) {
+                        // 免費額度用完：放回佇列，等一分鐘再試
+                        prefQueue.unshift(...jobs);
+                        geminiNextAt = Date.now() + GEMINI_QUOTA_WAIT_MS;
+                        setPrefStatus('quota');
+                    } else if (e.status === 401 || e.status === 403 || (e.status === 400 && /api key/i.test(e.message || ''))) {
+                        setPrefStatus('bad-key');
+                        prefQueue.length = 0;
+                        break;
+                    } else if (e.status === 404) {
+                        // 模型被下架：清快取，下一輪重新挑
+                        geminiModel = '';
+                        GM_setValue(GEMINI_MODEL_STORE, null);
+                        prefQueue.unshift(...jobs);
+                    } else {
+                        setPrefStatus('error');
+                    }
+                }
+                panelDirty = true;
+                updateBadge();
+            }
+        } finally {
+            prefRunning = false;
+        }
+    }
+
     function getPrefStatusText() {
         if (!config.aiPreference) return '🧠 喜好 AI：已關閉（竄改猴選單可開啟）';
+        if (getGeminiKey()) {
+            switch (prefStatus) {
+                case 'need-examples':
+                    return `🧠 喜好 AI（Gemini）：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」就開始學習`;
+                case 'quota': return `🧠 喜好 AI（Gemini）：免費額度暫時用完，1 分鐘後重試・排隊 ${prefQueue.length}`;
+                case 'bad-key': return '🧠 喜好 AI（Gemini）：API 金鑰無效，請從竄改猴選單重新設定';
+                case 'error': return '🧠 喜好 AI（Gemini）：請求失敗（詳見主控台），下一批會再試';
+                case 'ready':
+                    return `🧠 喜好 AI（Gemini${geminiModel ? ' ' + geminiModel : ''}）：運作中・已學 ${config.dislikeExamples.length} 則不喜歡・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
+                        (prefQueue.length ? `・排隊 ${prefQueue.length}` : '');
+                default: return '🧠 喜好 AI（Gemini）：檢查中…';
+            }
+        }
         switch (prefStatus) {
-            case 'unsupported': return '🧠 喜好 AI：此瀏覽器或電腦不支援（需 Chrome 且硬體足夠）';
+            case 'unsupported': return '🧠 喜好 AI：此瀏覽器或電腦不支援；可從竄改猴選單設定 Gemini API 金鑰改用雲端';
             case 'need-click': return '🧠 喜好 AI：點一下頁面任意處開始下載模型（約 2～4 GB）';
             case 'downloading': return `🧠 喜好 AI：模型下載中 ${prefProgress}%…`;
             case 'error': return '🧠 喜好 AI：啟動失敗（詳見主控台）';
@@ -822,6 +1006,8 @@
             let aiIcons = '';
             if (aiStatus === 'ready') aiIcons += '🤖';
             if (prefStatus === 'ready') aiIcons += '🧠';
+            if (prefStatus === 'quota') aiIcons += '🧠⏸';
+            if (prefStatus === 'bad-key' || prefStatus === 'error') aiIcons += '🧠⚠️';
             if (aiStatus === 'downloading' || prefStatus === 'downloading') aiIcons += '⏳';
             if (aiIcons) aiIcons = ` · ${aiIcons}`;
 
@@ -1784,6 +1970,22 @@
             () => {
                 config.aiPreference = !config.aiPreference;
                 saveConfig(config);
+                location.reload();
+            }
+        );
+
+        GM_registerMenuCommand(
+            getGeminiKey() ? '🔑 Gemini API 金鑰：[已設定]（點擊更換或清除）' : '🔑 設定 Gemini API 金鑰（改用雲端 AI）…',
+            () => {
+                const input = window.prompt(
+                    '貼上 Google AI Studio（aistudio.google.com）建立的 Gemini API 金鑰。\n' +
+                    '設定後喜好 AI 改用 Gemini 雲端判斷，貼文內容會送到 Google。\n' +
+                    '留空並按確定＝清除金鑰，改回 Chrome 內建 AI。',
+                    ''
+                );
+                if (input === null) return;
+                GM_setValue(GEMINI_KEY_STORE, input.trim());
+                GM_setValue(GEMINI_MODEL_STORE, null);
                 location.reload();
             }
         );
