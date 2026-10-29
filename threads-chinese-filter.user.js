@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.13.0
+// @version      1.14.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -43,7 +43,10 @@
         aiLanguageDetect: true,     // 用 Chrome 內建 AI 語言偵測複查規則放行的貼文
         blockedAuthors: [],         // 🚫 封鎖的作者帳號
         blockedKeywords: [],        // 🚫 封鎖的關鍵字
-        dislikedPosts: []           // 🚫 單則隱藏的貼文（貼文網址）
+        dislikedPosts: [],          // 🚫 單則隱藏的貼文（貼文網址）
+        aiPreference: true,         // 🧠 用 Chrome 內建 Gemini Nano 學你的喜好，藏掉相似貼文
+        dislikeExamples: [],        // 🧠 你不喜歡的貼文內文（AI 的反例）
+        keepExamples: []            // 🧠 被 AI 誤藏、你還原的貼文內文（AI 的正例）
     };
 
     function loadConfig() {
@@ -63,7 +66,7 @@
         cfg = cfg || Object.assign({}, DEFAULT_CONFIG);
 
         // 陣列要複製一份，不然會改到 DEFAULT_CONFIG 本身
-        ['blockedAuthors', 'blockedKeywords', 'dislikedPosts'].forEach((k) => {
+        ['blockedAuthors', 'blockedKeywords', 'dislikedPosts', 'dislikeExamples', 'keepExamples'].forEach((k) => {
             cfg[k] = Array.isArray(cfg[k]) ? cfg[k].slice() : [];
         });
 
@@ -354,7 +357,10 @@
                     const scamLabel = getScamLabel(post);
                     if (scamLabel) addScamWarning(post, scamLabel);
                 }
-                if (!restoredKeys.has(key)) queueAiLanguageCheck(post, key, info, contentText);
+                if (!restoredKeys.has(key)) {
+                    queueAiLanguageCheck(post, key, info, contentText);
+                    queuePrefCheck(post, key, info, contentText);
+                }
             }
 
             post.dataset.threadsFiltered = reason ? 'hidden' : 'kept';
@@ -515,6 +521,193 @@
         }
     }
 
+    // ==========================================
+    // 3-2. AI 學你的喜好 (Chrome 內建 Gemini Nano / Prompt API)
+    // 你按「🚫 不喜歡」的貼文當反例、按「還原顯示」的 AI 誤判當正例，讓 AI 藏掉相似貼文
+    // ==========================================
+    const PREF_MIN_EXAMPLES = 3;       // 至少要有幾則不喜歡的例子才開始判斷
+    const PREF_MAX_DISLIKES = 20;
+    const PREF_MAX_KEEPS = 10;
+    const PREF_EXAMPLE_CHARS = 120;
+    const PREF_MIN_CHARS = 10;         // 內文太短不送
+    const PREF_REASON = 'AI：像你不喜歡的';
+    let prefStatus = 'idle';           // idle / unsupported / need-click / downloading / ready / error
+    let prefProgress = 0;
+    let prefBase = null;               // 帶好系統提示的基底 session，每則貼文 clone 一份來問
+    let prefBaseDirty = true;
+    let prefCreating = null;
+    const prefQueue = [];
+    let prefRunning = false;
+    const prefStats = { checked: 0, hidden: 0 };
+
+    function getLanguageModelApi() {
+        if (typeof LanguageModel !== 'undefined') return LanguageModel;
+        if (typeof unsafeWindow !== 'undefined' && unsafeWindow.LanguageModel) return unsafeWindow.LanguageModel;
+        return null;
+    }
+
+    function setPrefStatus(status) {
+        prefStatus = status;
+        panelDirty = true;
+        updateBadge();
+    }
+
+    const PREF_MODEL_OPTIONS = {
+        expectedInputs: [{ type: 'text', languages: ['en', 'ja'] }],
+        expectedOutputs: [{ type: 'text', languages: ['en'] }]
+    };
+
+    async function initPrefModel() {
+        if (!config.aiPreference) return;
+        const api = getLanguageModelApi();
+        if (!api) {
+            setPrefStatus('unsupported');
+            return;
+        }
+        try {
+            const availability = await api.availability(PREF_MODEL_OPTIONS);
+            if (availability === 'unavailable') {
+                setPrefStatus('unsupported');
+            } else if (availability === 'available') {
+                await buildPrefBase();
+            } else {
+                // 模型要下載時，Chrome 規定必須由使用者點擊觸發
+                setPrefStatus('need-click');
+                document.addEventListener('pointerdown', buildPrefBase, { capture: true, once: true });
+            }
+        } catch (e) {
+            console.warn('[Threads Filter] AI 喜好過濾初始化失敗', e);
+            setPrefStatus('error');
+        }
+    }
+
+    function buildPrefPrompt() {
+        const clip = (t) => t.replace(/\s+/g, ' ').slice(0, PREF_EXAMPLE_CHARS);
+        const dislikes = config.dislikeExamples.map((t, i) => `D${i + 1}: ${clip(t)}`).join('\n');
+        const keeps = config.keepExamples.map((t, i) => `K${i + 1}: ${clip(t)}`).join('\n') || '(none)';
+        return [
+            'You filter a Threads social media feed for one user. Posts are mostly in Traditional Chinese.',
+            'Posts the user DISLIKED (hide posts similar to these in topic, intent or style):',
+            dislikes,
+            'Posts the user wants to KEEP (never hide posts like these):',
+            keeps,
+            'For each new post, answer only JSON {"hide": true} if it is clearly similar to the disliked posts,',
+            'otherwise {"hide": false}. When unsure, answer {"hide": false}.'
+        ].join('\n');
+    }
+
+    function buildPrefBase() {
+        if (prefCreating) return prefCreating;
+        const api = getLanguageModelApi();
+        if (!api) return null;
+        // 例子不夠先不建模型；第 3 次按「不喜歡」時（使用者點擊中）再建，順便觸發下載
+        if (config.dislikeExamples.length < PREF_MIN_EXAMPLES) {
+            setPrefStatus('need-examples');
+            return null;
+        }
+
+        if (prefStatus !== 'ready') setPrefStatus('downloading');
+        const old = prefBase;
+        prefCreating = api.create(Object.assign({}, PREF_MODEL_OPTIONS, {
+            initialPrompts: [{ role: 'system', content: buildPrefPrompt() }],
+            monitor(m) {
+                m.addEventListener('downloadprogress', (e) => {
+                    prefProgress = Math.round((e.loaded || 0) * 100);
+                    setPrefStatus('downloading');
+                });
+            }
+        })).then((session) => {
+            prefBase = session;
+            prefBaseDirty = false;
+            if (old) old.destroy();
+            setPrefStatus('ready');
+            runPrefQueue();
+        }).catch((e) => {
+            console.warn('[Threads Filter] AI 喜好過濾模型建立失敗', e);
+            setPrefStatus('error');
+        }).finally(() => {
+            prefCreating = null;
+        });
+        return prefCreating;
+    }
+
+    function addPrefExample(listName, text) {
+        const t = (text || '').trim();
+        if (t.length < PREF_MIN_CHARS) return;
+        const max = listName === 'dislikeExamples' ? PREF_MAX_DISLIKES : PREF_MAX_KEEPS;
+        const list = config[listName].filter((x) => x !== t);
+        list.push(t);
+        while (list.length > max) list.shift();
+        config[listName] = list;
+        saveConfig(config);
+        prefBaseDirty = true;
+
+        // 例子變了就重建；第一次湊滿例子也從這裡開始（此時在使用者點擊中，可觸發模型下載）
+        if (config.aiPreference && !['idle', 'unsupported'].includes(prefStatus)) buildPrefBase();
+        panelDirty = true;
+        updateBadge();
+    }
+
+    function queuePrefCheck(post, key, info, contentText) {
+        if (!config.aiPreference || post.dataset.threadsPrefChecked) return;
+        if (config.dislikeExamples.length < PREF_MIN_EXAMPLES) return;
+        const text = cleanPostContent(contentText);
+        if (text.length < PREF_MIN_CHARS) return;
+
+        post.dataset.threadsPrefChecked = 'true';
+        prefQueue.push({ post, key, info, contentText, text });
+        runPrefQueue();
+    }
+
+    async function runPrefQueue() {
+        if (prefRunning || !prefBase || prefBaseDirty) return;
+        prefRunning = true;
+        while (prefQueue.length > 0 && prefBase && !prefBaseDirty) {
+            const job = prefQueue.shift();
+            if (!config.enabled || !job.post.isConnected || job.post.dataset.threadsHidden || restoredKeys.has(job.key)) continue;
+
+            let session = null;
+            try {
+                session = await prefBase.clone();
+                const answer = await session.prompt(job.text.slice(0, 600), {
+                    responseConstraint: {
+                        type: 'object',
+                        properties: { hide: { type: 'boolean' } },
+                        required: ['hide']
+                    }
+                });
+                prefStats.checked++;
+                if (JSON.parse(answer).hide === true) {
+                    prefStats.hidden++;
+                    hidePost(job.post, job.key, job.info, job.contentText, PREF_REASON);
+                }
+                panelDirty = true;
+                updateBadge();
+            } catch (e) {
+                console.warn('[Threads Filter] AI 喜好判斷失敗', e);
+            } finally {
+                if (session) session.destroy();
+            }
+        }
+        prefRunning = false;
+    }
+
+    function getPrefStatusText() {
+        if (!config.aiPreference) return '🧠 喜好 AI：已關閉（竄改猴選單可開啟）';
+        switch (prefStatus) {
+            case 'unsupported': return '🧠 喜好 AI：此瀏覽器或電腦不支援（需 Chrome 且硬體足夠）';
+            case 'need-click': return '🧠 喜好 AI：點一下頁面任意處開始下載模型（約 2～4 GB）';
+            case 'downloading': return `🧠 喜好 AI：模型下載中 ${prefProgress}%…`;
+            case 'error': return '🧠 喜好 AI：啟動失敗（詳見主控台）';
+            case 'need-examples':
+                return `🧠 喜好 AI：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」就開始學習`;
+            case 'ready':
+                return `🧠 喜好 AI：運作中・已學 ${config.dislikeExamples.length} 則不喜歡・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
+                    (prefQueue.length ? `・排隊 ${prefQueue.length}` : '');
+            default: return '🧠 喜好 AI：檢查中…';
+        }
+    }
+
     function getPostInfo(postEl) {
         const authorLink = postEl.querySelector('a[href^="/@"]');
         const authorMatch = authorLink ? authorLink.getAttribute('href').match(/^\/@([^/?#]+)/) : null;
@@ -544,6 +737,11 @@
 
         restoredKeys.add(key);
         hiddenPosts.delete(key);
+
+        // AI 藏錯了：這則當正例，之後別再藏類似的
+        if (item.reason === PREF_REASON) {
+            addPrefExample('keepExamples', cleanPostContent(item.text));
+        }
 
         if (item.reason === '不喜歡') {
             config.dislikedPosts = config.dislikedPosts.filter((k) => k !== key);
@@ -616,16 +814,23 @@
         if (!badgeEl) return;
 
         // 狀態沒變就不重寫 DOM，避免觸發 MutationObserver 造成每幀空轉
-        const state = `${config.enabled}|${hiddenPosts.size}`;
+        const state = `${config.enabled}|${hiddenPosts.size}|${aiStatus}|${prefStatus}`;
         if (state !== lastBadgeState) {
             lastBadgeState = state;
+
+            // AI 運作中就在膠囊上亮圖示：🤖 語言偵測、🧠 喜好 AI；下載中顯示 ⏳
+            let aiIcons = '';
+            if (aiStatus === 'ready') aiIcons += '🤖';
+            if (prefStatus === 'ready') aiIcons += '🧠';
+            if (aiStatus === 'downloading' || prefStatus === 'downloading') aiIcons += '⏳';
+            if (aiIcons) aiIcons = ` · ${aiIcons}`;
 
             if (!config.enabled) {
                 badgeEl.innerHTML = '⏸️ <span style="opacity: 0.85;">中文過濾已暫停</span>';
                 badgeEl.style.borderColor = 'rgba(255, 255, 255, 0.1)';
                 badgeEl.style.background = 'rgba(40, 40, 40, 0.85)';
             } else {
-                badgeEl.innerHTML = `🉐 <span style="color: #4ade80;">過濾中</span> · 已隱藏 <b>${hiddenPosts.size}</b> 則`;
+                badgeEl.innerHTML = `🉐 <span style="color: #4ade80;">過濾中</span> · 已隱藏 <b>${hiddenPosts.size}</b> 則${aiIcons}`;
                 badgeEl.style.borderColor = 'rgba(74, 222, 128, 0.3)';
                 badgeEl.style.background = 'rgba(18, 18, 18, 0.88)';
             }
@@ -712,6 +917,11 @@
         aiLine.textContent = getAiStatusText();
         aiLine.setAttribute('style', `padding:6px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.08);color:${aiStatus === 'ready' ? '#4ade80' : '#94a3b8'};`);
         panelEl.appendChild(aiLine);
+
+        const prefLine = document.createElement('div');
+        prefLine.textContent = getPrefStatusText();
+        prefLine.setAttribute('style', `padding:6px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.08);color:${prefStatus === 'ready' ? '#4ade80' : '#94a3b8'};`);
+        panelEl.appendChild(prefLine);
 
         // 封鎖名單：作者與關鍵字，點 ✕ 解除
         const blockItems = [
@@ -855,12 +1065,15 @@
                 if (config.dislikedPosts.length > MAX_DISLIKED_POSTS) config.dislikedPosts.shift();
                 saveConfig(config);
             }
-            hidePost(post, key, info, extractPostText(post), '不喜歡');
+            const text = extractPostText(post);
+            hidePost(post, key, info, text, '不喜歡');
+            addPrefExample('dislikeExamples', cleanPostContent(text));
             updateBadge();
         }));
 
         if (info.author) {
             menu.appendChild(makeToolButton(`封鎖 @${info.author}`, '這個帳號的貼文全部隱藏', () => {
+                addPrefExample('dislikeExamples', cleanPostContent(extractPostText(post)));
                 addBlockItem('blockedAuthors', info.author);
             }));
         }
@@ -1567,6 +1780,26 @@
         );
 
         GM_registerMenuCommand(
+            config.aiPreference ? '🧠 喜好 AI：[開啟]（點擊切換）' : '🧠 喜好 AI：[關閉]（點擊切換）',
+            () => {
+                config.aiPreference = !config.aiPreference;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        GM_registerMenuCommand(
+            `🧠 清除喜好 AI 學到的例子（目前 ${config.dislikeExamples.length} 則不喜歡、${config.keepExamples.length} 則保留）`,
+            () => {
+                if (!window.confirm('清除喜好 AI 學到的所有例子？')) return;
+                config.dislikeExamples = [];
+                config.keepExamples = [];
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        GM_registerMenuCommand(
             config.aiLanguageDetect ? '🤖 AI 語言偵測：[開啟]（點擊切換）' : '🤖 AI 語言偵測：[關閉]（點擊切換）',
             () => {
                 config.aiLanguageDetect = !config.aiLanguageDetect;
@@ -1628,6 +1861,7 @@
         addPostTools();
         checkActiveImageLifecycle();
         initAiDetector();
+        initPrefModel();
 
         const observer = new MutationObserver((mutations) => {
             let hasNodes = false;
