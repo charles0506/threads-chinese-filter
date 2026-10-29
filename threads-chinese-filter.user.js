@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.12.0
+// @version      1.13.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -40,7 +40,10 @@
         enableImageZoom: true,      // 是否啟用圖片縮放功能 (點開燈箱後生效)
         scamMode: 'warn',           // 非台灣新帳號貼文：'warn' 加紅框提醒 / 'hide' 直接隱藏 / 'off' 不處理
         keepMediaPosts: true,       // 有圖片或影片的貼文一律不做語言過濾
-        aiLanguageDetect: true      // 用 Chrome 內建 AI 語言偵測複查規則放行的貼文
+        aiLanguageDetect: true,     // 用 Chrome 內建 AI 語言偵測複查規則放行的貼文
+        blockedAuthors: [],         // 🚫 封鎖的作者帳號
+        blockedKeywords: [],        // 🚫 封鎖的關鍵字
+        dislikedPosts: []           // 🚫 單則隱藏的貼文（貼文網址）
     };
 
     function loadConfig() {
@@ -58,6 +61,11 @@
             console.warn('[Threads Filter] 讀取設定失敗，使用預設值', e);
         }
         cfg = cfg || Object.assign({}, DEFAULT_CONFIG);
+
+        // 陣列要複製一份，不然會改到 DEFAULT_CONFIG 本身
+        ['blockedAuthors', 'blockedKeywords', 'dislikedPosts'].forEach((k) => {
+            cfg[k] = Array.isArray(cfg[k]) ? cfg[k].slice() : [];
+        });
 
         // v1.8.0 的舊開關：關掉過的維持關閉
         if ('filterScamAccounts' in cfg) {
@@ -336,7 +344,8 @@
             const info = getPostInfo(post);
             // 以貼文連結當 key，Threads 重繪同一則貼文時不會重複計數
             const key = info.href || `${info.author}|${contentText.slice(0, 80)}`;
-            const reason = restoredKeys.has(key) ? null : getHideReason(post, contentText);
+            const reason = restoredKeys.has(key) ? null
+                : (getUserBlockReason(info, key, contentText) || getHideReason(post, contentText));
 
             if (reason) {
                 hidePost(post, key, info, contentText, reason);
@@ -536,6 +545,11 @@
         restoredKeys.add(key);
         hiddenPosts.delete(key);
 
+        if (item.reason === '不喜歡') {
+            config.dislikedPosts = config.dislikedPosts.filter((k) => k !== key);
+            saveConfig(config);
+        }
+
         if (item.el && item.el.isConnected) {
             item.el.style.display = '';
             delete item.el.dataset.threadsHidden;
@@ -699,6 +713,24 @@
         aiLine.setAttribute('style', `padding:6px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.08);color:${aiStatus === 'ready' ? '#4ade80' : '#94a3b8'};`);
         panelEl.appendChild(aiLine);
 
+        // 封鎖名單：作者與關鍵字，點 ✕ 解除
+        const blockItems = [
+            ...config.blockedAuthors.map((v) => ({ list: 'blockedAuthors', value: v, label: `@${v}` })),
+            ...config.blockedKeywords.map((v) => ({ list: 'blockedKeywords', value: v, label: `「${v}」` }))
+        ];
+        if (blockItems.length > 0) {
+            const blockBox = document.createElement('div');
+            blockBox.setAttribute('style', 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,0.08);font-size:12px;');
+            const label = document.createElement('span');
+            label.textContent = '封鎖名單：';
+            label.style.opacity = '0.7';
+            blockBox.appendChild(label);
+            blockItems.forEach((item) => {
+                blockBox.appendChild(makePanelButton(`${item.label} ✕`, () => removeBlockItem(item.list, item.value)));
+            });
+            panelEl.appendChild(blockBox);
+        }
+
         const list = document.createElement('div');
         list.setAttribute('style', 'overflow-y:auto;flex:1;');
 
@@ -756,33 +788,146 @@
     // ==========================================
     // 4-2. 貼文圖片/影片下載
     // ==========================================
-    const DL_BTN_STYLE = 'display:inline-flex;align-items:center;gap:4px;margin:6px 12px 8px;padding:4px 12px;border-radius:9999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-size:12px;cursor:pointer;';
+    const DL_BTN_STYLE = 'display:inline-flex;align-items:center;gap:4px;padding:4px 12px;border-radius:9999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-size:12px;cursor:pointer;';
 
-    function addDownloadButtons() {
+    /**
+     * 貼文底部工具列：🚫 不喜歡（每則都有）＋ ⬇ 下載（有圖片/影片才有）
+     */
+    function addPostTools() {
         getTopLevelPostElements().forEach((post) => {
-            if (post.dataset.threadsDl || post.dataset.threadsHidden) return;
-            if (!hasMedia(post)) return;
+            if (post.dataset.threadsHidden) return;
 
-            post.dataset.threadsDl = 'true';
+            let bar = post.querySelector(':scope > .threads-tools');
+            if (!bar) {
+                bar = document.createElement('div');
+                bar.className = 'threads-tools';
+                bar.setAttribute('style', 'display:flex;flex-wrap:wrap;gap:6px;margin:6px 12px 8px;');
+                // 貼文整塊可點擊會跳到貼文頁，工具列上的事件不能往上傳
+                ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click'].forEach((type) => {
+                    bar.addEventListener(type, (e) => e.stopPropagation());
+                });
+                bar.appendChild(makeToolButton('🚫 不喜歡', '隱藏這則、封鎖作者或加關鍵字', (btn) => showDislikeMenu(post, bar)));
+                post.appendChild(bar);
+            }
 
-            const btn = document.createElement('button');
-            btn.className = 'threads-dl-btn';
-            btn.textContent = '⬇ 下載圖片/影片';
-            btn.title = '下載這則貼文的所有圖片與影片（原始解析度）';
-            btn.setAttribute('style', DL_BTN_STYLE);
-
-            // 貼文整塊可點擊會跳到貼文頁，按鈕上的事件不能往上傳
-            ['pointerdown', 'mousedown', 'mouseup', 'pointerup'].forEach((type) => {
-                btn.addEventListener(type, (e) => e.stopPropagation());
-            });
-            btn.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                downloadPostMedia(post, btn);
-            });
-
-            post.appendChild(btn);
+            if (!post.dataset.threadsDl && hasMedia(post)) {
+                post.dataset.threadsDl = 'true';
+                const btn = makeToolButton('⬇ 下載圖片/影片', '下載這則貼文的所有圖片與影片（原始解析度）', (b) => downloadPostMedia(post, b));
+                btn.classList.add('threads-dl-btn');
+                bar.appendChild(btn);
+            }
         });
+    }
+
+    function makeToolButton(label, title, onClick) {
+        const btn = document.createElement('button');
+        btn.textContent = label;
+        btn.title = title;
+        btn.setAttribute('style', DL_BTN_STYLE);
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            onClick(btn);
+        });
+        return btn;
+    }
+
+    // ==========================================
+    // 4-3. 不喜歡 / 封鎖作者 / 關鍵字
+    // ==========================================
+    const MAX_DISLIKED_POSTS = 1000;
+
+    function showDislikeMenu(post, bar) {
+        const old = bar.querySelector('.threads-dislike-menu');
+        if (old) {
+            old.remove();
+            return;
+        }
+
+        const info = getPostInfo(post);
+        const menu = document.createElement('div');
+        menu.className = 'threads-dislike-menu';
+        menu.setAttribute('style', 'display:flex;flex-wrap:wrap;gap:6px;width:100%;');
+
+        menu.appendChild(makeToolButton('隱藏這則', '只隱藏這一則，之後不再出現', () => {
+            const key = getPostKey(post, info);
+            if (!config.dislikedPosts.includes(key)) {
+                config.dislikedPosts.push(key);
+                if (config.dislikedPosts.length > MAX_DISLIKED_POSTS) config.dislikedPosts.shift();
+                saveConfig(config);
+            }
+            hidePost(post, key, info, extractPostText(post), '不喜歡');
+            updateBadge();
+        }));
+
+        if (info.author) {
+            menu.appendChild(makeToolButton(`封鎖 @${info.author}`, '這個帳號的貼文全部隱藏', () => {
+                addBlockItem('blockedAuthors', info.author);
+            }));
+        }
+
+        menu.appendChild(makeToolButton('加關鍵字…', '內文含這個字的貼文全部隱藏；可先反白選取文字', () => {
+            const selected = (window.getSelection && window.getSelection().toString().trim()) || '';
+            const kw = (window.prompt('內文含這個字的貼文都隱藏（不分大小寫）：', selected.slice(0, 30)) || '').trim();
+            if (kw) addBlockItem('blockedKeywords', kw);
+        }));
+
+        menu.appendChild(makeToolButton('取消', '', () => menu.remove()));
+        bar.appendChild(menu);
+    }
+
+    function getPostKey(post, info) {
+        return info.href || `${info.author}|${extractPostText(post).slice(0, 80)}`;
+    }
+
+    /**
+     * 使用者自訂的封鎖規則；命中回傳原因字串，否則 null
+     */
+    function getUserBlockReason(info, key, text) {
+        if (info.author && config.blockedAuthors.includes(info.author)) return '封鎖作者';
+        if (config.dislikedPosts.includes(key)) return '不喜歡';
+        const lower = text.toLowerCase();
+        const kw = config.blockedKeywords.find((k) => lower.includes(k.toLowerCase()));
+        if (kw) return `關鍵字：${kw}`;
+        return null;
+    }
+
+    function addBlockItem(listName, value) {
+        if (!config[listName].includes(value)) {
+            config[listName].push(value);
+            saveConfig(config);
+        }
+        rescanKeptPosts();
+    }
+
+    function removeBlockItem(listName, value) {
+        config[listName] = config[listName].filter((v) => v !== value);
+        saveConfig(config);
+
+        // 被這條規則藏起來的貼文放回來
+        const reason = listName === 'blockedAuthors' ? '封鎖作者' : `關鍵字：${value}`;
+        hiddenPosts.forEach((item, key) => {
+            if (item.reason !== reason) return;
+            if (listName === 'blockedAuthors' && item.author !== value) return;
+            if (item.el && item.el.isConnected) {
+                item.el.style.display = '';
+                delete item.el.dataset.threadsHidden;
+                delete item.el.dataset.threadsFiltered;
+            }
+            hiddenPosts.delete(key);
+        });
+        panelDirty = true;
+        rescanKeptPosts();
+    }
+
+    /**
+     * 規則變了，已放行的貼文重新判斷一次
+     */
+    function rescanKeptPosts() {
+        document.querySelectorAll('[data-threads-filtered="kept"]').forEach((el) => {
+            delete el.dataset.threadsFiltered;
+        });
+        panelDirty = true;
+        scheduleProcess();
     }
 
     /**
@@ -1469,7 +1614,7 @@
             scheduled = true;
             requestAnimationFrame(() => {
                 processFeed();
-                addDownloadButtons();
+                addPostTools();
                 checkActiveImageLifecycle();
                 scheduled = false;
             });
@@ -1480,7 +1625,7 @@
         createBadge();
         registerMenuCommands();
         processFeed();
-        addDownloadButtons();
+        addPostTools();
         checkActiveImageLifecycle();
         initAiDetector();
 
