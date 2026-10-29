@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.15.0
+// @version      1.16.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -15,6 +15,9 @@
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @connect      generativelanguage.googleapis.com
+// @connect      api.openai.com
+// @connect      api.groq.com
+// @connect      openrouter.ai
 // @connect      cdninstagram.com
 // @connect      fbcdn.net
 // @run-at       document-idle
@@ -562,7 +565,7 @@
 
     async function initPrefModel() {
         if (!config.aiPreference) return;
-        if (getGeminiKey()) {
+        if (hasCloudAi()) {
             setPrefStatus(config.dislikeExamples.length < PREF_MIN_EXAMPLES ? 'need-examples' : 'ready');
             return;
         }
@@ -608,7 +611,7 @@
     }
 
     function buildPrefBase() {
-        if (getGeminiKey()) {
+        if (hasCloudAi()) {
             // 雲端模式不用建 session，每次請求都帶最新的例子
             prefBaseDirty = false;
             setPrefStatus(config.dislikeExamples.length < PREF_MIN_EXAMPLES ? 'need-examples' : 'ready');
@@ -678,7 +681,7 @@
     }
 
     async function runPrefQueue() {
-        if (getGeminiKey()) return runGeminiQueue();
+        if (hasCloudAi()) return runCloudQueue();
         if (prefRunning || !prefBase || prefBaseDirty) return;
         prefRunning = true;
         while (prefQueue.length > 0 && prefBase && !prefBaseDirty) {
@@ -712,32 +715,85 @@
     }
 
     // ------------------------------------------
-    // Gemini 雲端模式：一次送多則貼文，配合免費額度限速
+    // 雲端 AI 模式：Gemini / OpenAI (GPT) / Groq / OpenRouter，一次送多則貼文並限速
     // 金鑰只存在竄改猴的 GM 儲存區，不放 localStorage（Threads 網頁讀得到 localStorage）
     // ------------------------------------------
-    const GEMINI_KEY_STORE = 'threads_filter_gemini_key';
-    const GEMINI_MODEL_STORE = 'threads_filter_gemini_model';
-    const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta/';
-    const GEMINI_BATCH = 10;           // 一次請求判斷幾則
-    const GEMINI_INTERVAL_MS = 6000;   // 兩次請求至少間隔，約每分鐘 10 次
-    const GEMINI_QUOTA_WAIT_MS = 60000;
-    let geminiNextAt = 0;
-    let geminiModel = '';
+    const CLOUD_PROVIDER_STORE = 'threads_filter_ai_provider';
+    const CLOUD_KEY_STORE = 'threads_filter_ai_key';
+    const CLOUD_MODEL_STORE = 'threads_filter_ai_model';      // 使用者指定的模型，空的就自動挑
+    const CLOUD_MODEL_CACHE = 'threads_filter_ai_model_cache'; // 自動挑的結果，快取 7 天
+    const GEMINI_KEY_STORE = 'threads_filter_gemini_key';      // v1.15.0 的舊金鑰位置
+    const CLOUD_BATCH = 10;            // 一次請求判斷幾則
+    const CLOUD_QUOTA_WAIT_MS = 60000;
 
-    function getGeminiKey() {
+    // pick：從模型清單自動挑模型時，依序比對，先中先贏
+    const CLOUD_PROVIDERS = {
+        gemini: {
+            name: 'Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/', intervalMs: 6000,
+            keyUrl: 'https://aistudio.google.com/apikey'
+        },
+        openai: {
+            name: 'OpenAI GPT', base: 'https://api.openai.com/v1/', intervalMs: 2000,
+            keyUrl: 'https://platform.openai.com/api-keys',
+            pick: [/^gpt-[\d.]+-nano$/, /^gpt-[\d.]+-mini$/, /nano/, /mini/]
+        },
+        groq: {
+            name: 'Groq', base: 'https://api.groq.com/openai/v1/', intervalMs: 3000,
+            keyUrl: 'https://console.groq.com/keys',
+            pick: [/qwen/i, /llama.*instant/i, /llama/i]
+        },
+        openrouter: {
+            name: 'OpenRouter', base: 'https://openrouter.ai/api/v1/', intervalMs: 4000,
+            keyUrl: 'https://openrouter.ai/settings/keys',
+            pick: [/qwen.*:free$/i, /gemma.*:free$/i, /llama.*:free$/i, /:free$/]
+        }
+    };
+
+    let cloudNextAt = 0;
+    let cloudModel = '';
+
+    function gmGet(key, fallback) {
         try {
-            return typeof GM_getValue === 'function' ? (GM_getValue(GEMINI_KEY_STORE, '') || '') : '';
+            return typeof GM_getValue === 'function' ? GM_getValue(key, fallback) : fallback;
         } catch (e) {
-            return '';
+            return fallback;
         }
     }
 
-    function geminiRequest(method, path, body) {
+    function getCloudProvider() {
+        const p = gmGet(CLOUD_PROVIDER_STORE, '');
+        if (p && CLOUD_PROVIDERS[p]) return p;
+        return gmGet(GEMINI_KEY_STORE, '') ? 'gemini' : '';
+    }
+
+    function getCloudKey() {
+        const p = getCloudProvider();
+        if (!p) return '';
+        return gmGet(CLOUD_KEY_STORE, '') || (p === 'gemini' ? gmGet(GEMINI_KEY_STORE, '') : '');
+    }
+
+    function hasCloudAi() {
+        return !!getCloudKey();
+    }
+
+    function cloudName() {
+        const p = CLOUD_PROVIDERS[getCloudProvider()];
+        return p ? p.name : '雲端';
+    }
+
+    function cloudRequest(method, path, body) {
+        const provider = getCloudProvider();
+        const headers = { 'Content-Type': 'application/json' };
+        if (provider === 'gemini') {
+            headers['x-goog-api-key'] = getCloudKey();
+        } else {
+            headers.Authorization = `Bearer ${getCloudKey()}`;
+        }
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method,
-                url: GEMINI_API + path,
-                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': getGeminiKey() },
+                url: CLOUD_PROVIDERS[provider].base + path,
+                headers,
                 data: body ? JSON.stringify(body) : undefined,
                 timeout: 30000,
                 onload: (res) => {
@@ -746,7 +802,8 @@
                     if (res.status >= 200 && res.status < 300 && json) {
                         resolve(json);
                     } else {
-                        reject({ status: res.status, message: (json && json.error && json.error.message) || res.statusText });
+                        const err = json && json.error;
+                        reject({ status: res.status, message: (err && (err.message || err.code)) || res.statusText });
                     }
                 },
                 onerror: () => reject({ status: 0, message: '連線失敗' }),
@@ -756,67 +813,109 @@
     }
 
     /**
-     * 自動挑最新的 Flash-Lite 模型（免費額度最多），結果快取 7 天
+     * 決定要用的模型：使用者指定的優先；否則查模型清單自動挑，結果快取 7 天
      */
-    async function resolveGeminiModel() {
-        if (geminiModel) return geminiModel;
-        const cached = GM_getValue(GEMINI_MODEL_STORE, null);
-        if (cached && cached.name && Date.now() - cached.at < 7 * 86400000) {
-            geminiModel = cached.name;
-            return geminiModel;
+    async function resolveCloudModel() {
+        if (cloudModel) return cloudModel;
+        const provider = getCloudProvider();
+        const userModel = (gmGet(CLOUD_MODEL_STORE, '') || '').trim();
+        if (userModel) {
+            cloudModel = userModel;
+            return cloudModel;
+        }
+        const cached = gmGet(CLOUD_MODEL_CACHE, null);
+        if (cached && cached.provider === provider && cached.name && Date.now() - cached.at < 7 * 86400000) {
+            cloudModel = cached.name;
+            return cloudModel;
         }
 
-        const res = await geminiRequest('GET', 'models?pageSize=1000');
-        const candidates = (res.models || [])
-            .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
-            .map((m) => m.name.replace(/^models\//, ''))
-            .filter((n) => /flash-lite/.test(n) && !/tts|image|audio|live|embed/.test(n));
-        if (candidates.length === 0) throw { status: 0, message: '找不到可用的 Flash-Lite 模型' };
+        let picked = '';
+        if (provider === 'gemini') {
+            // 挑最新的正式版 Flash-Lite（免費額度最多）
+            const res = await cloudRequest('GET', 'models?pageSize=1000');
+            const candidates = (res.models || [])
+                .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+                .map((m) => m.name.replace(/^models\//, ''))
+                .filter((n) => /flash-lite/.test(n) && !/tts|image|audio|live|embed/.test(n));
+            const score = (n) => {
+                const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '0');
+                return (n.includes('preview') ? 0 : 1000) + v * 10 - n.length / 1000;
+            };
+            candidates.sort((a, b) => score(b) - score(a));
+            picked = candidates[0] || '';
+        } else {
+            const res = await cloudRequest('GET', 'models');
+            const ids = (res.data || []).map((m) => m.id)
+                .filter((id) => !/embed|whisper|tts|audio|image|vision|guard|realtime|transcribe|search|moderation/i.test(id))
+                .sort()
+                .reverse();
+            for (const re of CLOUD_PROVIDERS[provider].pick) {
+                picked = ids.find((id) => re.test(id)) || '';
+                if (picked) break;
+            }
+        }
+        if (!picked) throw { status: 0, message: '找不到合適的模型，請從選單手動指定模型名稱' };
 
-        const score = (n) => {
-            const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '0');
-            return (n.includes('preview') ? 0 : 1000) + v * 10 - n.length / 1000;
-        };
-        candidates.sort((a, b) => score(b) - score(a));
-        geminiModel = candidates[0];
-        GM_setValue(GEMINI_MODEL_STORE, { name: geminiModel, at: Date.now() });
-        return geminiModel;
+        cloudModel = picked;
+        GM_setValue(CLOUD_MODEL_CACHE, { provider, name: picked, at: Date.now() });
+        return cloudModel;
     }
 
-    async function geminiJudge(texts) {
-        const model = await resolveGeminiModel();
-        const posts = texts.map((t, i) => `#${i + 1}: ${t.replace(/\s+/g, ' ').slice(0, 400)}`).join('\n\n');
-        const res = await geminiRequest('POST', `models/${model}:generateContent`, {
-            systemInstruction: { parts: [{ text: buildPrefPrompt(true) }] },
-            contents: [{ role: 'user', parts: [{ text: posts }] }],
-            generationConfig: {
-                temperature: 0,
-                responseMimeType: 'application/json',
-                responseSchema: {
-                    type: 'OBJECT',
-                    properties: { hide: { type: 'ARRAY', items: { type: 'INTEGER' } } },
-                    required: ['hide']
+    function formatBatch(texts) {
+        return texts.map((t, i) => `#${i + 1}: ${t.replace(/\s+/g, ' ').slice(0, 400)}`).join('\n\n');
+    }
+
+    async function cloudJudge(texts) {
+        const model = await resolveCloudModel();
+        let text = '';
+
+        if (getCloudProvider() === 'gemini') {
+            const res = await cloudRequest('POST', `models/${model}:generateContent`, {
+                systemInstruction: { parts: [{ text: buildPrefPrompt(true) }] },
+                contents: [{ role: 'user', parts: [{ text: formatBatch(texts) }] }],
+                generationConfig: {
+                    temperature: 0,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: 'OBJECT',
+                        properties: { hide: { type: 'ARRAY', items: { type: 'INTEGER' } } },
+                        required: ['hide']
+                    }
                 }
-            }
-        });
-        const text = res.candidates && res.candidates[0] && res.candidates[0].content &&
-            res.candidates[0].content.parts.map((p) => p.text || '').join('');
-        const parsed = JSON.parse(text || '{"hide":[]}');
+            });
+            const c = res.candidates && res.candidates[0];
+            text = c && c.content ? c.content.parts.map((p) => p.text || '').join('') : '';
+        } else {
+            // OpenAI 相容格式（OpenAI / Groq / OpenRouter 都吃）
+            const res = await cloudRequest('POST', 'chat/completions', {
+                model,
+                response_format: { type: 'json_object' },
+                messages: [
+                    { role: 'system', content: buildPrefPrompt(true) },
+                    { role: 'user', content: formatBatch(texts) }
+                ]
+            });
+            text = res.choices && res.choices[0] && res.choices[0].message ? res.choices[0].message.content || '' : '';
+        }
+
+        // 有些開源模型會先吐 <think>…</think> 或 ```json 包裝，只取第一個 {…}
+        const json = (text || '').replace(/<think>[\s\S]*?<\/think>/g, '').match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(json ? json[0] : '{"hide":[]}');
         return new Set((parsed.hide || []).map(Number));
     }
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    async function runGeminiQueue() {
+    async function runCloudQueue() {
         if (prefRunning || prefStatus === 'bad-key' || config.dislikeExamples.length < PREF_MIN_EXAMPLES) return;
         prefRunning = true;
         try {
             while (prefQueue.length > 0) {
-                const wait = geminiNextAt - Date.now();
+                const wait = cloudNextAt - Date.now();
                 if (wait > 0) await sleep(wait);
 
                 const jobs = [];
-                while (prefQueue.length > 0 && jobs.length < GEMINI_BATCH) {
+                while (prefQueue.length > 0 && jobs.length < CLOUD_BATCH) {
                     const job = prefQueue.shift();
                     if (config.enabled && job.post.isConnected && !job.post.dataset.threadsHidden && !restoredKeys.has(job.key)) {
                         jobs.push(job);
@@ -824,9 +923,9 @@
                 }
                 if (jobs.length === 0) continue;
 
-                geminiNextAt = Date.now() + GEMINI_INTERVAL_MS;
+                cloudNextAt = Date.now() + CLOUD_PROVIDERS[getCloudProvider()].intervalMs;
                 try {
-                    const hide = await geminiJudge(jobs.map((j) => j.text));
+                    const hide = await cloudJudge(jobs.map((j) => j.text));
                     prefStats.checked += jobs.length;
                     jobs.forEach((job, i) => {
                         if (hide.has(i + 1) && job.post.isConnected && !job.post.dataset.threadsHidden) {
@@ -836,11 +935,11 @@
                     });
                     if (prefStatus !== 'ready') setPrefStatus('ready');
                 } catch (e) {
-                    console.warn('[Threads Filter] Gemini 判斷失敗', e);
+                    console.warn(`[Threads Filter] ${cloudName()} 判斷失敗`, e);
                     if (e.status === 429) {
-                        // 免費額度用完：放回佇列，等一分鐘再試
+                        // 額度或速度上限：放回佇列，等一分鐘再試
                         prefQueue.unshift(...jobs);
-                        geminiNextAt = Date.now() + GEMINI_QUOTA_WAIT_MS;
+                        cloudNextAt = Date.now() + CLOUD_QUOTA_WAIT_MS;
                         setPrefStatus('quota');
                     } else if (e.status === 401 || e.status === 403 || (e.status === 400 && /api key/i.test(e.message || ''))) {
                         setPrefStatus('bad-key');
@@ -848,8 +947,8 @@
                         break;
                     } else if (e.status === 404) {
                         // 模型被下架：清快取，下一輪重新挑
-                        geminiModel = '';
-                        GM_setValue(GEMINI_MODEL_STORE, null);
+                        cloudModel = '';
+                        GM_setValue(CLOUD_MODEL_CACHE, null);
                         prefQueue.unshift(...jobs);
                     } else {
                         setPrefStatus('error');
@@ -863,19 +962,61 @@
         }
     }
 
+    /**
+     * 竄改猴選單：選雲端 AI 服務、貼金鑰、（可選）指定模型
+     */
+    function configureCloudAi() {
+        const choice = window.prompt(
+            '喜好 AI 要用哪個雲端服務？輸入數字：\n' +
+            '1 = Google Gemini（有免費額度）\n' +
+            '2 = OpenAI GPT（付費，需先儲值）\n' +
+            '3 = Groq（有免費額度，跑開源模型）\n' +
+            '4 = OpenRouter（有免費模型）\n' +
+            '0 = 清除金鑰，改回 Chrome 內建 AI',
+            ''
+        );
+        if (choice === null) return;
+        const provider = { 1: 'gemini', 2: 'openai', 3: 'groq', 4: 'openrouter' }[choice.trim()];
+
+        if (choice.trim() === '0') {
+            [CLOUD_PROVIDER_STORE, CLOUD_KEY_STORE, CLOUD_MODEL_STORE, CLOUD_MODEL_CACHE, GEMINI_KEY_STORE]
+                .forEach((k) => GM_setValue(k, ''));
+            location.reload();
+            return;
+        }
+        if (!provider) {
+            window.alert('請輸入 0～4 的數字');
+            return;
+        }
+
+        const info = CLOUD_PROVIDERS[provider];
+        const key = window.prompt(`貼上 ${info.name} 的 API 金鑰\n（在 ${info.keyUrl} 建立）\n設定後貼文內容會送到 ${info.name}。`, '');
+        if (key === null || !key.trim()) return;
+        const model = window.prompt('模型名稱（留空＝自動挑便宜／免費的）：', '');
+        if (model === null) return;
+
+        GM_setValue(CLOUD_PROVIDER_STORE, provider);
+        GM_setValue(CLOUD_KEY_STORE, key.trim());
+        GM_setValue(CLOUD_MODEL_STORE, model.trim());
+        GM_setValue(CLOUD_MODEL_CACHE, null);
+        GM_setValue(GEMINI_KEY_STORE, '');
+        location.reload();
+    }
+
     function getPrefStatusText() {
         if (!config.aiPreference) return '🧠 喜好 AI：已關閉（竄改猴選單可開啟）';
-        if (getGeminiKey()) {
+        if (hasCloudAi()) {
+            const name = cloudName();
             switch (prefStatus) {
                 case 'need-examples':
-                    return `🧠 喜好 AI（Gemini）：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」就開始學習`;
-                case 'quota': return `🧠 喜好 AI（Gemini）：免費額度暫時用完，1 分鐘後重試・排隊 ${prefQueue.length}`;
-                case 'bad-key': return '🧠 喜好 AI（Gemini）：API 金鑰無效，請從竄改猴選單重新設定';
-                case 'error': return '🧠 喜好 AI（Gemini）：請求失敗（詳見主控台），下一批會再試';
+                    return `🧠 喜好 AI（${name}）：再按 ${PREF_MIN_EXAMPLES - config.dislikeExamples.length} 次「🚫 不喜歡」→「隱藏這則」或「封鎖」就開始學習`;
+                case 'quota': return `🧠 喜好 AI（${name}）：額度或速度上限，1 分鐘後重試・排隊 ${prefQueue.length}（OpenAI 也可能是沒儲值）`;
+                case 'bad-key': return `🧠 喜好 AI（${name}）：API 金鑰無效，請從竄改猴選單重新設定`;
+                case 'error': return `🧠 喜好 AI（${name}）：請求失敗（詳見主控台），下一批會再試`;
                 case 'ready':
-                    return `🧠 喜好 AI（Gemini${geminiModel ? ' ' + geminiModel : ''}）：運作中・已學 ${config.dislikeExamples.length} 則不喜歡・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
+                    return `🧠 喜好 AI（${name}${cloudModel ? ' ' + cloudModel : ''}）：運作中・已學 ${config.dislikeExamples.length} 則不喜歡・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
                         (prefQueue.length ? `・排隊 ${prefQueue.length}` : '');
-                default: return '🧠 喜好 AI（Gemini）：檢查中…';
+                default: return `🧠 喜好 AI（${name}）：檢查中…`;
             }
         }
         switch (prefStatus) {
@@ -1975,19 +2116,8 @@
         );
 
         GM_registerMenuCommand(
-            getGeminiKey() ? '🔑 Gemini API 金鑰：[已設定]（點擊更換或清除）' : '🔑 設定 Gemini API 金鑰（改用雲端 AI）…',
-            () => {
-                const input = window.prompt(
-                    '貼上 Google AI Studio（aistudio.google.com）建立的 Gemini API 金鑰。\n' +
-                    '設定後喜好 AI 改用 Gemini 雲端判斷，貼文內容會送到 Google。\n' +
-                    '留空並按確定＝清除金鑰，改回 Chrome 內建 AI。',
-                    ''
-                );
-                if (input === null) return;
-                GM_setValue(GEMINI_KEY_STORE, input.trim());
-                GM_setValue(GEMINI_MODEL_STORE, null);
-                location.reload();
-            }
+            hasCloudAi() ? `🔑 雲端 AI：[${cloudName()}]（點擊更換或清除）` : '🔑 設定雲端 AI（Gemini / GPT / Groq / OpenRouter）…',
+            configureCloudAi
         );
 
         GM_registerMenuCommand(

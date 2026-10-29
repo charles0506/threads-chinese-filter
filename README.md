@@ -7,7 +7,7 @@
    - 首頁動態牆滑動看貼文完全不干涉。
    - 點開圖片時：**滾輪往上滾放大**；原始大小**往下滾直接保留 Threads 原生「下滑關閉」手勢**！兩個功能完美共存，絕不衝突！
 
-![版本](https://img.shields.io/badge/version-1.15.0-blue)
+![版本](https://img.shields.io/badge/version-1.16.0-blue)
 ![授權](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -74,7 +74,14 @@
 
 ### 🧠 2-0-1. 喜好 AI：學你不喜歡什麼
 - 兩種執行方式，自動擇一：
-  - **Google Gemini 雲端（有設金鑰時）**：Firefox、Chrome、VM 都能用。到 [Google AI Studio](https://aistudio.google.com/apikey) 建立免費 API 金鑰，從竄改猴選單「🔑 設定 Gemini API 金鑰」貼上。自動挑最新的 Flash-Lite 模型，一次送 10 則、約每 6 秒一次以配合免費額度；額度用完會暫停 1 分鐘再試。**貼文內容會送到 Google。** 金鑰只存在竄改猴儲存區，不放網頁 localStorage。
+  - **雲端 AI（有設金鑰時）**：Firefox、Chrome、VM 都能用。從竄改猴選單「🔑 設定雲端 AI」選服務、貼金鑰；模型可留空自動挑。一次送 10 則；遇到額度上限暫停 1 分鐘再試。**貼文內容會送到該服務。** 金鑰只存在竄改猴儲存區，不放網頁 localStorage。
+
+    | 服務 | 費用 | 申請金鑰 | 自動挑的模型 |
+    |---|---|---|---|
+    | Google Gemini | 有免費額度 | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | 最新正式版 Flash-Lite |
+    | OpenAI GPT | 付費，需先儲值 | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | 最新 nano，其次 mini |
+    | Groq | 有免費額度 | [console.groq.com/keys](https://console.groq.com/keys) | Qwen，其次 Llama |
+    | OpenRouter | 有免費模型 | [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) | 名稱結尾 `:free` 的 Qwen／Gemma／Llama |
   - **Chrome 內建 Gemini Nano（沒設金鑰時）**：模型在本機執行、免費、不上傳貼文；第一次需下載約 2～4 GB，硬體不足或在 VM 裡時 Chrome 會回報不支援。
 - 你按「🚫 不喜歡」→「隱藏這則」或「封鎖作者」時，那則內文會記成反例（最多 20 則）。累積 3 則後開始運作，自動隱藏內容相似的貼文，清單原因標「AI：像你不喜歡的」。
 - AI 藏錯了就在清單按「還原顯示」，那則會記成正例（最多 10 則），之後不再藏類似貼文。
