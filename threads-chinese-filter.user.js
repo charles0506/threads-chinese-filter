@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.16.0
+// @version      1.17.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -382,16 +382,41 @@
         const existing = hiddenPosts.get(key);
         if (existing) {
             existing.el = post;
+            if (existing.thumbs.length === 0) {
+                existing.thumbs = getThumbs(post);
+                if (existing.thumbs.length > 0) panelDirty = true;
+            }
         } else {
             hiddenPosts.set(key, {
                 el: post,
                 author: info.author,
                 href: info.href,
                 text: contentText.trim(),
+                thumbs: getThumbs(post),
                 reason
             });
             panelDirty = true;
         }
+    }
+
+    /**
+     * 清單縮圖：隱藏當下就記下網址，之後貼文被 Threads 回收也看得到
+     */
+    const MAX_THUMBS = 4;
+    function getThumbs(post) {
+        const thumbs = [];
+        post.querySelectorAll('video').forEach((video) => {
+            const cover = video.parentElement && video.parentElement.querySelector('img');
+            const coverSrc = video.poster || (cover && (cover.currentSrc || cover.src));
+            // Threads 影片通常沒有封面圖，改用影片第一格
+            if (coverSrc) thumbs.push({ src: coverSrc, video: true });
+            else if (video.currentSrc || video.src) thumbs.push({ src: video.currentSrc || video.src, video: true, frame: true });
+        });
+        getMediaImages(post).forEach((img) => {
+            const src = img.currentSrc || img.src;
+            if (src) thumbs.push({ src, video: false });
+        });
+        return thumbs.filter((t) => /^https:/.test(t.src)).slice(0, MAX_THUMBS);
     }
 
     // ==========================================
@@ -1300,6 +1325,42 @@
             text.textContent = item.text ? (item.text.length > 160 ? item.text.slice(0, 160) + '…' : item.text) : '（無文字）';
             text.setAttribute('style', 'opacity:0.85;line-height:1.45;white-space:pre-wrap;word-break:break-word;margin-bottom:6px;');
             row.appendChild(text);
+
+            if (item.thumbs.length > 0) {
+                const thumbBox = document.createElement('div');
+                thumbBox.setAttribute('style', 'display:flex;gap:4px;margin-bottom:6px;');
+                item.thumbs.forEach((t) => {
+                    const cell = document.createElement('a');
+                    cell.href = item.href || t.src;
+                    cell.target = '_blank';
+                    cell.rel = 'noopener noreferrer';
+                    cell.title = t.video ? '影片（點擊開啟貼文）' : '圖片（點擊開啟貼文）';
+                    cell.setAttribute('style', 'position:relative;display:block;width:72px;height:72px;border-radius:6px;overflow:hidden;background:#222;flex:none;');
+                    let media;
+                    if (t.frame) {
+                        media = document.createElement('video');
+                        media.src = t.src + '#t=0.1';
+                        media.preload = 'metadata';
+                        media.muted = true;
+                        media.playsInline = true;
+                    } else {
+                        media = document.createElement('img');
+                        media.src = t.src;
+                        media.loading = 'lazy';
+                    }
+                    media.setAttribute('style', 'width:100%;height:100%;object-fit:cover;display:block;');
+                    media.addEventListener('error', () => cell.remove());
+                    cell.appendChild(media);
+                    if (t.video) {
+                        const play = document.createElement('span');
+                        play.textContent = '▶';
+                        play.setAttribute('style', 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;text-shadow:0 0 6px #000;');
+                        cell.appendChild(play);
+                    }
+                    thumbBox.appendChild(cell);
+                });
+                row.appendChild(thumbBox);
+            }
 
             const actions = document.createElement('div');
             actions.setAttribute('style', 'display:flex;gap:6px;');
