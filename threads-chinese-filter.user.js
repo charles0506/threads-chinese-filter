@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.11.2
+// @version      1.11.3
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -207,12 +207,20 @@
 
         const cleanText = cleanPostContent(rawText);
         const letterCount = countMatches(cleanText, /\p{L}/gu);
+        const hanCount = countMatches(cleanText, CJK_UNIFIED_REGEX);
+
+        // 泰文、日文、韓文等一看就是外文的文字最先判斷，配圖也不放行
+        const scriptReason = getForeignScriptReason(cleanText, hanCount);
+        if (scriptReason) return scriptReason;
 
         if (config.keepMediaPosts && letterCount <= MEDIA_CAPTION_MAX_LETTERS && hasMedia(postEl)) {
             return null;
         }
 
-        if (config.filterTranslationPosts && hasTranslationTrigger(postEl)) {
+        // Threads 偶爾也會在中文貼文旁放翻譯鈕；漢字數不少於拉丁字母單字數就當中文貼文，不理它
+        const latinWordCount = countMatches(cleanText, /[a-zA-ZÀ-ɏ]+/g);
+        const chineseDominant = hanCount > 0 && hanCount >= latinWordCount;
+        if (config.filterTranslationPosts && !chineseDominant && hasTranslationTrigger(postEl)) {
             return '翻譯按鈕';
         }
 
@@ -221,8 +229,16 @@
             return config.hidePureMedia ? '純影音' : null;
         }
 
-        const hanCount = countMatches(cleanText, CJK_UNIFIED_REGEX);
+        if (hanCount === 0) {
+            if (LATIN_WORDS_REGEX.test(cleanText) || letterCount > 3) {
+                return '無中文';
+            }
+        }
 
+        return null;
+    }
+
+    function getForeignScriptReason(cleanText, hanCount) {
         if (config.filterKorean) {
             const hangulCount = countMatches(cleanText, KOREAN_HANGUL_REGEX);
             if (hangulCount > 0 && hangulCount > hanCount * HANGUL_TO_HAN_RATIO) {
@@ -239,12 +255,6 @@
 
         if (config.filterOtherAlphabets && OTHER_NON_LATIN_SCRIPTS.test(cleanText)) {
             return '其他文字';
-        }
-
-        if (hanCount === 0) {
-            if (LATIN_WORDS_REGEX.test(cleanText) || letterCount > 3) {
-                return '無中文';
-            }
         }
 
         return null;
