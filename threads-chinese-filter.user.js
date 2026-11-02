@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.19.0
+// @version      1.20.0
 // @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載（圖片可自動轉 JPG），滑到圖片上點「⬇ JPG」或 Alt + 點圖片可單張下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
@@ -608,7 +608,7 @@
 
     async function initPrefModel() {
         if (!config.aiPreference) return;
-        if (hasCloudAi()) {
+        if (useCloudAi()) {
             setPrefStatus(hasPrefSignal() ? 'ready' : 'need-examples');
             return;
         }
@@ -660,7 +660,7 @@
     }
 
     function buildPrefBase() {
-        if (hasCloudAi()) {
+        if (useCloudAi()) {
             // 雲端模式不用建 session，每次請求都帶最新的例子
             prefBaseDirty = false;
             setPrefStatus(hasPrefSignal() ? 'ready' : 'need-examples');
@@ -752,7 +752,7 @@
     }
 
     async function runPrefQueue() {
-        if (hasCloudAi()) return runCloudQueue();
+        if (useCloudAi()) return runCloudQueue();
         if (prefRunning || !prefBase || prefBaseDirty) return;
         prefRunning = true;
         while (prefQueue.length > 0 && prefBase && !prefBaseDirty) {
@@ -822,6 +822,49 @@
 
     let cloudNextAt = 0;
     let cloudModel = '';
+    // 雲端被擋時本頁改用 Chrome 內建 AI：
+    // 'region' = 所在地區不支援（多半是開了 VPN），重新整理才再試；'daily' = 今日額度用完，換日自動恢復
+    let cloudBlocked = '';
+    let cloudBlockedDay = '';
+    const CLOUD_USAGE_STORE = 'threads_filter_ai_usage';
+
+    // Gemini 每日額度在美西午夜重置（台灣下午 3 點或 4 點），用量也照美西日期算
+    function usageDay() {
+        return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
+    }
+
+    function useCloudAi() {
+        if (cloudBlocked === 'daily' && cloudBlockedDay !== usageDay()) cloudBlocked = '';
+        return hasCloudAi() && !cloudBlocked;
+    }
+
+    /**
+     * 今日用量（存在竄改猴儲存區，多個分頁共用）
+     */
+    function getCloudUsage() {
+        const u = gmGet(CLOUD_USAGE_STORE, null);
+        const provider = getCloudProvider();
+        if (u && u.day === usageDay() && u.provider === provider) return u;
+        return { day: usageDay(), provider, requests: 0, posts: 0, failed: 0 };
+    }
+
+    function addCloudUsage(posts, failed) {
+        const u = getCloudUsage();
+        u.requests++;
+        u.posts += posts;
+        if (failed) u.failed++;
+        GM_setValue(CLOUD_USAGE_STORE, u);
+    }
+
+    function getCloudUsageText() {
+        const u = getCloudUsage();
+        return `今日已送 ${u.requests} 次請求（${u.posts} 則${u.failed ? `，失敗 ${u.failed} 次` : ''}）`;
+    }
+
+    // Gemini：400「User location is not supported」；OpenAI：403「unsupported_country_region_territory」
+    function isRegionError(e) {
+        return (e.status === 400 || e.status === 403) && /location is not supported|unsupported_country|region|territory/i.test(e.message || '');
+    }
 
     function gmGet(key, fallback) {
         try {
@@ -980,6 +1023,7 @@
     async function runCloudQueue() {
         if (prefRunning || prefStatus === 'bad-key' || !hasPrefSignal()) return;
         prefRunning = true;
+        let switchToLocal = false;
         try {
             while (prefQueue.length > 0) {
                 const wait = cloudNextAt - Date.now();
@@ -997,6 +1041,7 @@
                 cloudNextAt = Date.now() + CLOUD_PROVIDERS[getCloudProvider()].intervalMs;
                 try {
                     const hide = await cloudJudge(jobs.map((j) => j.text));
+                    addCloudUsage(jobs.length, false);
                     prefStats.checked += jobs.length;
                     jobs.forEach((job, i) => {
                         if (hide.has(i + 1) && job.post.isConnected && !job.post.dataset.threadsHidden) {
@@ -1007,7 +1052,15 @@
                     if (prefStatus !== 'ready') setPrefStatus('ready');
                 } catch (e) {
                     console.warn(`[Threads Filter] ${cloudName()} 判斷失敗`, e);
-                    if (e.status === 429) {
+                    addCloudUsage(jobs.length, true);
+                    if (isRegionError(e) || (e.status === 429 && /per ?day/i.test(e.message || ''))) {
+                        // 地區不支援或今日額度用完：重試也沒用，這批放回佇列交給 Chrome 內建 AI
+                        prefQueue.unshift(...jobs);
+                        cloudBlocked = isRegionError(e) ? 'region' : 'daily';
+                        cloudBlockedDay = usageDay();
+                        switchToLocal = true;
+                        break;
+                    } else if (e.status === 429) {
                         // 額度或速度上限：放回佇列，等一分鐘再試
                         prefQueue.unshift(...jobs);
                         cloudNextAt = Date.now() + CLOUD_QUOTA_WAIT_MS;
@@ -1030,6 +1083,12 @@
             }
         } finally {
             prefRunning = false;
+        }
+        if (switchToLocal) {
+            console.warn(`[Threads Filter] ${cloudName()} ${cloudBlocked === 'region' ? '不支援目前的網路地區（多半是開了 VPN）' : '今日額度已用完'}，本頁改用 Chrome 內建 AI`);
+            prefBaseDirty = true;
+            prefStatus = 'idle';
+            initPrefModel();
         }
     }
 
@@ -1083,6 +1142,12 @@
 
     function getPrefStatusText() {
         if (!config.aiPreference) return '🧠 喜好 AI：已關閉（竄改猴選單可開啟）';
+        if (hasCloudAi() && !useCloudAi()) {
+            const why = cloudBlocked === 'region'
+                ? `${cloudName()} 不支援你目前的網路地區（多半是開了 VPN），關掉 VPN 後重新整理即可恢復`
+                : `${cloudName()} 今日額度用完，美西午夜（台灣下午 3～4 點）後自動恢復`;
+            return `⚠️ ${why}・${getCloudUsageText()}｜` + getLocalPrefStatusText().replace('🧠 喜好 AI：', '🧠 喜好 AI（暫用 Chrome 內建）：');
+        }
         if (hasCloudAi()) {
             const name = cloudName();
             switch (prefStatus) {
@@ -1093,10 +1158,14 @@
                 case 'error': return `🧠 喜好 AI（${name}）：請求失敗（詳見主控台），下一批會再試`;
                 case 'ready':
                     return `🧠 喜好 AI（${name}${cloudModel ? ' ' + cloudModel : ''}）：運作中・${getPrefLearnedText()}・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
-                        (prefQueue.length ? `・排隊 ${prefQueue.length}` : '');
+                        (prefQueue.length ? `・排隊 ${prefQueue.length}` : '') + `・${getCloudUsageText()}`;
                 default: return `🧠 喜好 AI（${name}）：檢查中…`;
             }
         }
+        return getLocalPrefStatusText();
+    }
+
+    function getLocalPrefStatusText() {
         switch (prefStatus) {
             case 'unsupported': return '🧠 喜好 AI：此瀏覽器或電腦不支援；可從竄改猴選單設定 Gemini API 金鑰改用雲端';
             case 'need-click': return '🧠 喜好 AI：點一下頁面任意處開始下載模型（約 2～4 GB）';
@@ -1217,7 +1286,7 @@
         if (!badgeEl) return;
 
         // 狀態沒變就不重寫 DOM，避免觸發 MutationObserver 造成每幀空轉
-        const state = `${config.enabled}|${hiddenPosts.size}|${aiStatus}|${prefStatus}`;
+        const state = `${config.enabled}|${hiddenPosts.size}|${aiStatus}|${prefStatus}|${cloudBlocked}`;
         if (state !== lastBadgeState) {
             lastBadgeState = state;
 
@@ -1226,6 +1295,7 @@
             if (aiStatus === 'ready') aiIcons += '🤖';
             if (prefStatus === 'ready') aiIcons += '🧠';
             if (prefStatus === 'quota') aiIcons += '🧠⏸';
+            if (cloudBlocked) aiIcons += '🌐';
             if (prefStatus === 'bad-key' || prefStatus === 'error') aiIcons += '🧠⚠️';
             if (aiStatus === 'downloading' || prefStatus === 'downloading') aiIcons += '⏳';
             if (aiIcons) aiIcons = ` · ${aiIcons}`;
@@ -2396,7 +2466,7 @@
         );
 
         add(
-            hasCloudAi() ? `🔑 雲端 AI：[${cloudName()}]（點擊更換或清除）` : '🔑 設定雲端 AI（Gemini / GPT / Groq / OpenRouter）…',
+            hasCloudAi() ? `🔑 雲端 AI：[${cloudName()}・今日 ${getCloudUsage().requests} 次]（點擊更換或清除）` : '🔑 設定雲端 AI（Gemini / GPT / Groq / OpenRouter）…',
             configureCloudAi
         );
 

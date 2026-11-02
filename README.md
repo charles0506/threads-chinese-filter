@@ -7,7 +7,7 @@
    - 首頁動態牆滑動看貼文完全不干涉。
    - 點開圖片時：**滾輪往上滾放大**；原始大小**往下滾直接保留 Threads 原生「下滑關閉」手勢**！兩個功能完美共存，絕不衝突！
 
-![版本](https://img.shields.io/badge/version-1.19.0-blue)
+![版本](https://img.shields.io/badge/version-1.20.0-blue)
 ![授權](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -75,6 +75,9 @@
 ### 🧠 2-0-1. 喜好 AI：學你不喜歡什麼
 - 兩種執行方式，自動擇一：
   - **雲端 AI（有設金鑰時）**：Firefox、Chrome、VM 都能用。從竄改猴選單「🔑 設定雲端 AI」選服務、貼金鑰；模型可留空自動挑。一次送 10 則；遇到額度上限暫停 1 分鐘再試。**貼文內容會送到該服務。** 金鑰只存在竄改猴儲存區，不放網頁 localStorage。
+    - **地區不支援時自動改用本機**：開 VPN 時 Gemini 會回「User location is not supported」（OpenAI 是 `unsupported_country_region_territory`）。偵測到就**停止送出**，本頁改用 Chrome 內建 AI，膠囊多一個 🌐。關掉 VPN 後重新整理即恢復。
+    - **今日額度用完**（Gemini 回 429 且是每日上限）：同樣改用 Chrome 內建 AI，美西午夜（台灣下午 3～4 點）換日後自動切回雲端。每分鐘上限的 429 仍是等 1 分鐘再試。
+    - **今日用量**：右下角膠囊點開的面板、竄改猴選單「🔑 雲端 AI」都會顯示今天送了幾次請求（幾則貼文、失敗幾次）。照美西日期計算，與 Gemini 每日額度重置時間一致；多個分頁共用同一份計數。選單上的數字在重新整理時更新。官方實際用量請看 <https://aistudio.google.com/usage>。
 
     | 服務 | 費用 | 申請金鑰 | 自動挑的模型 |
     |---|---|---|---|
