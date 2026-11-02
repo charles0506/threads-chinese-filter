@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.20.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載（圖片可自動轉 JPG），滑到圖片上點「⬇ JPG」或 Alt + 點圖片可單張下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
+// @version      1.21.0
+// @description  自動隱藏 Threads 與 Instagram（首頁動態、Reels）上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載（圖片可自動轉 JPG），滑到圖片上點「⬇ JPG」或 Alt + 點圖片可單張下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
 // @match        https://threads.net/*
 // @match        https://threads.com/*
+// @match        https://www.instagram.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
@@ -48,6 +49,8 @@
         jpgQuality: 0.92,           // 轉 JPG 的品質（0~1）
         hoverJpgButton: true,       // 滑到圖片上出現「⬇ JPG」按鈕，Alt + 點圖片直接下載
         menuExpanded: false,        // 竄改猴選單是否展開「更多設定」
+        igFeed: true,               // Instagram 首頁動態牆也過濾
+        igReels: true,              // Instagram Reels 也過濾（外語的直接跳過）
         scamMode: 'warn',           // 非台灣新帳號貼文：'warn' 加紅框提醒 / 'hide' 直接隱藏 / 'off' 不處理
         keepMediaPosts: true,       // 有圖片或影片的貼文一律不做語言過濾
         aiLanguageDetect: true,     // 用 Chrome 內建 AI 語言偵測複查規則放行的貼文
@@ -104,6 +107,8 @@
     }
 
     let config = loadConfig();
+    // 設定、例子、封鎖清單存在竄改猴儲存區，Threads 與 IG 共用同一份
+    const IS_IG = /(^|\.)instagram\.com$/.test(location.hostname);
     const hiddenPosts = new Map();   // key -> { el, author, text, reason, href }，被過濾的貼文清單
     const restoredKeys = new Set();  // 使用者手動還原的貼文，之後不再隱藏
     let badgeEl = null;
@@ -303,7 +308,28 @@
         return false;
     }
 
+    // IG 介面上的中文字（「個讚」「則留言」「追蹤」…）會讓外文貼文被當成中文，逐段剔除
+    const IG_UI_TEXT_REGEX = /^(•|追蹤|已追蹤|追蹤中|更多|[.…]+\s*更多|more|[.…]+\s*more|贊助|Sponsored|原始音訊|Original audio|建議貼文|為你推薦|Suggested for you|已編輯|Edited|新增留言[.…]*|Add a comment[.…]*|查看翻譯|See translation|翻譯|Translate)$/i;
+    const IG_UI_COUNT_REGEX = /^((查看全部|View all)\s*)?[\d,.]+\s*(萬|K|M)?\s*(個讚|則留言|次觀看|次播放|likes?|comments?|views?|plays?)$|^(查看全部|View all).*(留言|comments)$|(說讚|liked by .*)$/i;
+
+    function extractIgPostText(postEl) {
+        const segments = [];
+        postEl.querySelectorAll('span[dir="auto"], div[dir="auto"], h1').forEach((el) => {
+            // 只取最內層，避免同一段字被外層 span 重複算
+            if (el.querySelector('span[dir="auto"], div[dir="auto"], h1')) return;
+            if (el.closest('header, a, button, [role="button"], time, form, textarea, .threads-tools')) return;
+            const t = el.innerText?.trim();
+            if (!t || isUiElement(el) || IG_UI_TEXT_REGEX.test(t) || IG_UI_COUNT_REGEX.test(t)) return;
+            // 說明文字前面那段只包著帳號連結，不是內文
+            const link = el.querySelector('a');
+            if (link && link.innerText.trim() === t) return;
+            segments.push(t);
+        });
+        return segments.join('\n');
+    }
+
     function extractPostText(postEl) {
+        if (IS_IG) return extractIgPostText(postEl);
         const textElements = postEl.querySelectorAll('span[dir="auto"], div[dir="auto"]');
         const textSegments = [];
 
@@ -324,7 +350,47 @@
         return postEl.innerText || '';
     }
 
+    /**
+     * IG：首頁動態牆的 <article>，以及 Reels 頁的每一支影片。
+     * 只在首頁與 Reels 過濾，點進單篇貼文、個人頁時不動，免得把你點開的貼文藏掉
+     */
+    function getIgPostElements() {
+        const path = location.pathname;
+        if (config.igFeed && path === '/') {
+            return Array.from(document.querySelectorAll('main article'))
+                .filter((a) => !(a.parentElement && a.parentElement.closest('article')));
+        }
+        if (config.igReels && /^\/reels?\//.test(path)) return getIgReelItems();
+        return [];
+    }
+
+    // Reels 沒有 <article>：從 <video> 往上找「幾乎滿版、且旁邊還有同樣滿版的兄弟」那一層當作一支
+    function getIgReelItems() {
+        const items = new Set();
+        const minH = window.innerHeight * 0.6;
+        document.querySelectorAll('main video').forEach((video) => {
+            let el = video;
+            while (el.parentElement && el.parentElement !== document.body) {
+                const parent = el.parentElement;
+                if (el.dataset.threadsReel) {
+                    items.add(el);
+                    break;
+                }
+                if (el.offsetHeight >= minH && Array.from(parent.children).filter((c) => c.offsetHeight >= minH).length >= 2) {
+                    el.dataset.threadsReel = 'true';
+                    items.add(el);
+                    break;
+                }
+                el = parent;
+            }
+        });
+        // 已藏起來的（display:none 量不到高度）也要回傳，狀態才不會被重算
+        document.querySelectorAll('[data-threads-reel="true"]').forEach((el) => items.add(el));
+        return Array.from(items);
+    }
+
     function getTopLevelPostElements() {
+        if (IS_IG) return getIgPostElements();
         const results = [];
         const candidates = document.querySelectorAll('article, div[data-pressable-container="true"]');
 
@@ -358,6 +424,8 @@
                 !(config.scamMode !== 'off' && !post.dataset.threadsScamWarned && getScamLabel(post))) return;
 
             const contentText = extractPostText(post);
+            // IG 的說明文字常比貼文晚出現；還沒抓到字就先不下結論，下一輪再看
+            if (IS_IG && !contentText.trim()) return;
             const info = getPostInfo(post);
             // 以貼文連結當 key，Threads 重繪同一則貼文時不會重複計數
             const key = info.href || `${info.author}|${contentText.slice(0, 80)}`;
@@ -386,6 +454,7 @@
     function hidePost(post, key, info, contentText, reason) {
         post.style.display = 'none';
         post.dataset.threadsHidden = 'true';
+        post.querySelectorAll('video').forEach((v) => v.pause());
         post.dataset.threadsFiltered = 'hidden';
 
         const existing = hiddenPosts.get(key);
@@ -649,7 +718,7 @@
             : [`For each new post, answer only JSON {"hide": true} if it is ${target},`,
                'otherwise {"hide": false}. When unsure, answer {"hide": false}.'];
         return [
-            'You filter a Threads social media feed for one user. Posts are mostly in Traditional Chinese.',
+            'You filter a social media feed (Threads / Instagram) for one user. Posts are mostly in Traditional Chinese.',
             ...(topics ? ['Topics the user said they do NOT want to see (most important rule):', topics] : []),
             'Posts the user DISLIKED (hide posts similar to these; when a reason is given, judge by that reason, not by other details of the post):',
             dislikes,
@@ -1180,7 +1249,20 @@
         }
     }
 
+    // IG 個人頁網址是 /帳號/，要排除 /p/、/reel/、/explore/ 這類功能頁
+    const IG_USER_PATH = /^\/(?!(?:p|reel|reels|explore|stories|direct|accounts|about|legal|developer|tv)\/)([A-Za-z0-9._]{1,30})\/?$/;
+    const IG_POST_PATH = /\/(p|reel)\/[^/?#]+/;
+
     function getPostInfo(postEl) {
+        if (IS_IG) {
+            const links = Array.from(postEl.querySelectorAll('a[href]'));
+            const authorLink = links.find((a) => IG_USER_PATH.test(a.getAttribute('href')));
+            const postLink = links.find((a) => IG_POST_PATH.test(a.getAttribute('href')));
+            return {
+                author: authorLink ? authorLink.getAttribute('href').match(IG_USER_PATH)[1] : '',
+                href: postLink ? new URL(postLink.getAttribute('href'), location.origin).href : ''
+            };
+        }
         const authorLink = postEl.querySelector('a[href^="/@"]');
         const authorMatch = authorLink ? authorLink.getAttribute('href').match(/^\/@([^/?#]+)/) : null;
         const postLink = postEl.querySelector('a[href*="/post/"]');
@@ -1528,10 +1610,15 @@
                     bar.addEventListener(type, (e) => e.stopPropagation());
                 });
                 bar.appendChild(makeToolButton('🚫 不喜歡', '隱藏這則、封鎖作者或加關鍵字', (btn) => showDislikeMenu(post, bar)));
+                if (post.dataset.threadsReel) {
+                    // Reels 是滿版影片，工具列浮在左上角
+                    if (getComputedStyle(post).position === 'static') post.style.position = 'relative';
+                    bar.style.cssText += 'position:absolute;top:12px;left:12px;z-index:10;margin:0;color:#fff;';
+                }
                 post.appendChild(bar);
             }
 
-            if (!post.dataset.threadsDl && hasMedia(post)) {
+            if (!IS_IG && !post.dataset.threadsDl && hasMedia(post)) {
                 post.dataset.threadsDl = 'true';
                 const btn = makeToolButton('⬇ 下載圖片/影片', '下載這則貼文的所有圖片與影片（原始解析度）', (b) => downloadPostMedia(post, b));
                 btn.classList.add('threads-dl-btn');
@@ -1961,6 +2048,10 @@
      * 判斷某張圖片是否位於「已點開的大圖燈箱/彈窗」內
      * 嚴格排除首頁動態牆貼文內的普通圖片
      */
+    function zoomEnabled() {
+        return config.enableImageZoom && !IS_IG;
+    }
+
     function isImageInsideLightbox(img) {
         if (!img) return false;
 
@@ -1996,7 +2087,7 @@
      * 尋找當前畫面中已被點開的燈箱彈窗大圖
      */
     function getActiveLightbox() {
-        if (!config.enableImageZoom) return null;
+        if (!zoomEnabled()) return null;
 
         const dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
         for (const dialog of dialogs) {
@@ -2139,7 +2230,7 @@
     window.addEventListener(
         'wheel',
         (e) => {
-            if (!config.enableImageZoom) return;
+            if (!zoomEnabled()) return;
 
             const elements = document.elementsFromPoint(e.clientX, e.clientY);
             let targetImg = elements.find(el => el.tagName === 'IMG' && el.naturalWidth > 80);
@@ -2257,7 +2348,7 @@
     window.addEventListener(
         'dblclick',
         (e) => {
-            if (!config.enableImageZoom) return;
+            if (!zoomEnabled()) return;
 
             const elements = document.elementsFromPoint(e.clientX, e.clientY);
             const targetImg = elements.find(el => el.tagName === 'IMG' && el.naturalWidth > 80);
@@ -2286,7 +2377,7 @@
     window.addEventListener(
         'keydown',
         (e) => {
-            if (!config.enableImageZoom) return;
+            if (!zoomEnabled()) return;
 
             const tag = e.target.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) {
@@ -2599,6 +2690,24 @@
         );
 
         add(
+            config.igFeed ? '📸 IG 首頁過濾：[開啟]（點擊切換）' : '📸 IG 首頁過濾：[關閉]（點擊切換）',
+            () => {
+                config.igFeed = !config.igFeed;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        add(
+            config.igReels ? '🎬 IG Reels 過濾：[開啟]（點擊切換）' : '🎬 IG Reels 過濾：[關閉]（點擊切換）',
+            () => {
+                config.igReels = !config.igReels;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        add(
             config.hoverJpgButton ? '⬇ 圖片上的下載按鈕：[開啟]（點擊切換）' : '⬇ 圖片上的下載按鈕：[關閉]（點擊切換）',
             () => {
                 config.hoverJpgButton = !config.hoverJpgButton;
@@ -2624,13 +2733,37 @@
         }
     }
 
+    /**
+     * 主控台輸入 threadsFilterDump() 看每則貼文抓到的帳號、文字與判斷結果，IG 改版時用來排查
+     */
+    function exposeDiagnostics() {
+        const dump = () => {
+            const rows = getTopLevelPostElements().map((post) => {
+                const info = getPostInfo(post);
+                const text = extractPostText(post);
+                return {
+                    帳號: info.author,
+                    連結: info.href,
+                    狀態: post.dataset.threadsFiltered || '',
+                    原因: post.dataset.threadsHidden ? (hiddenPosts.get(getPostKey(post, info)) || {}).reason : '',
+                    抓到的文字: text.replace(/\s+/g, ' ').slice(0, 80)
+                };
+            });
+            console.table(rows);
+            return `${rows.length} 則（${IS_IG ? 'Instagram ' + location.pathname : 'Threads'}）`;
+        };
+        const target = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        target.threadsFilterDump = dump;
+    }
+
     function init() {
         createBadge();
         registerMenuCommands();
         processFeed();
         addPostTools();
         checkActiveImageLifecycle();
-        initJpgHover();
+        if (!IS_IG) initJpgHover();
+        exposeDiagnostics();
         initAiDetector();
         initPrefModel();
 
