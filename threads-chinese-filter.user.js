@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Threads 繁簡中文過濾器與圖片縮放
 // @namespace    https://github.com/charles0506/threads-chinese-filter
-// @version      1.18.0
-// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
+// @version      1.20.0
+// @description  自動隱藏 Threads 上不含中文字元的非中文推薦貼文，點右下角徽章可查看被過濾的貼文清單；貼文圖片/影片一鍵下載（圖片可自動轉 JPG），滑到圖片上點「⬇ JPG」或 Alt + 點圖片可單張下載；點開圖片支援滾輪向上放大，原始大小向下滾動無縫相容 Threads 原生「下滑關閉」手勢，支援拖曳平移與 +/- 鍵
 // @author       charles0506
 // @match        https://*.threads.net/*
 // @match        https://*.threads.com/*
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @grant        GM_download
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
@@ -43,6 +44,10 @@
         hidePureMedia: false,       // 是否隱藏完全無內文的純照片/影片貼文 (預設保留)
         showBadge: true,            // 是否顯示右下角浮動統計膠囊
         enableImageZoom: true,      // 是否啟用圖片縮放功能 (點開燈箱後生效)
+        imageFormat: 'jpg',         // 下載圖片格式：'jpg' 轉成 JPG / 'original' 保留原檔（多半是 WebP）
+        jpgQuality: 0.92,           // 轉 JPG 的品質（0~1）
+        hoverJpgButton: true,       // 滑到圖片上出現「⬇ JPG」按鈕，Alt + 點圖片直接下載
+        menuExpanded: false,        // 竄改猴選單是否展開「更多設定」
         scamMode: 'warn',           // 非台灣新帳號貼文：'warn' 加紅框提醒 / 'hide' 直接隱藏 / 'off' 不處理
         keepMediaPosts: true,       // 有圖片或影片的貼文一律不做語言過濾
         aiLanguageDetect: true,     // 用 Chrome 內建 AI 語言偵測複查規則放行的貼文
@@ -603,7 +608,7 @@
 
     async function initPrefModel() {
         if (!config.aiPreference) return;
-        if (hasCloudAi()) {
+        if (useCloudAi()) {
             setPrefStatus(hasPrefSignal() ? 'ready' : 'need-examples');
             return;
         }
@@ -655,7 +660,7 @@
     }
 
     function buildPrefBase() {
-        if (hasCloudAi()) {
+        if (useCloudAi()) {
             // 雲端模式不用建 session，每次請求都帶最新的例子
             prefBaseDirty = false;
             setPrefStatus(hasPrefSignal() ? 'ready' : 'need-examples');
@@ -747,7 +752,7 @@
     }
 
     async function runPrefQueue() {
-        if (hasCloudAi()) return runCloudQueue();
+        if (useCloudAi()) return runCloudQueue();
         if (prefRunning || !prefBase || prefBaseDirty) return;
         prefRunning = true;
         while (prefQueue.length > 0 && prefBase && !prefBaseDirty) {
@@ -817,6 +822,49 @@
 
     let cloudNextAt = 0;
     let cloudModel = '';
+    // 雲端被擋時本頁改用 Chrome 內建 AI：
+    // 'region' = 所在地區不支援（多半是開了 VPN），重新整理才再試；'daily' = 今日額度用完，換日自動恢復
+    let cloudBlocked = '';
+    let cloudBlockedDay = '';
+    const CLOUD_USAGE_STORE = 'threads_filter_ai_usage';
+
+    // Gemini 每日額度在美西午夜重置（台灣下午 3 點或 4 點），用量也照美西日期算
+    function usageDay() {
+        return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
+    }
+
+    function useCloudAi() {
+        if (cloudBlocked === 'daily' && cloudBlockedDay !== usageDay()) cloudBlocked = '';
+        return hasCloudAi() && !cloudBlocked;
+    }
+
+    /**
+     * 今日用量（存在竄改猴儲存區，多個分頁共用）
+     */
+    function getCloudUsage() {
+        const u = gmGet(CLOUD_USAGE_STORE, null);
+        const provider = getCloudProvider();
+        if (u && u.day === usageDay() && u.provider === provider) return u;
+        return { day: usageDay(), provider, requests: 0, posts: 0, failed: 0 };
+    }
+
+    function addCloudUsage(posts, failed) {
+        const u = getCloudUsage();
+        u.requests++;
+        u.posts += posts;
+        if (failed) u.failed++;
+        GM_setValue(CLOUD_USAGE_STORE, u);
+    }
+
+    function getCloudUsageText() {
+        const u = getCloudUsage();
+        return `今日已送 ${u.requests} 次請求（${u.posts} 則${u.failed ? `，失敗 ${u.failed} 次` : ''}）`;
+    }
+
+    // Gemini：400「User location is not supported」；OpenAI：403「unsupported_country_region_territory」
+    function isRegionError(e) {
+        return (e.status === 400 || e.status === 403) && /location is not supported|unsupported_country|region|territory/i.test(e.message || '');
+    }
 
     function gmGet(key, fallback) {
         try {
@@ -975,6 +1023,7 @@
     async function runCloudQueue() {
         if (prefRunning || prefStatus === 'bad-key' || !hasPrefSignal()) return;
         prefRunning = true;
+        let switchToLocal = false;
         try {
             while (prefQueue.length > 0) {
                 const wait = cloudNextAt - Date.now();
@@ -992,6 +1041,7 @@
                 cloudNextAt = Date.now() + CLOUD_PROVIDERS[getCloudProvider()].intervalMs;
                 try {
                     const hide = await cloudJudge(jobs.map((j) => j.text));
+                    addCloudUsage(jobs.length, false);
                     prefStats.checked += jobs.length;
                     jobs.forEach((job, i) => {
                         if (hide.has(i + 1) && job.post.isConnected && !job.post.dataset.threadsHidden) {
@@ -1002,7 +1052,15 @@
                     if (prefStatus !== 'ready') setPrefStatus('ready');
                 } catch (e) {
                     console.warn(`[Threads Filter] ${cloudName()} 判斷失敗`, e);
-                    if (e.status === 429) {
+                    addCloudUsage(jobs.length, true);
+                    if (isRegionError(e) || (e.status === 429 && /per ?day/i.test(e.message || ''))) {
+                        // 地區不支援或今日額度用完：重試也沒用，這批放回佇列交給 Chrome 內建 AI
+                        prefQueue.unshift(...jobs);
+                        cloudBlocked = isRegionError(e) ? 'region' : 'daily';
+                        cloudBlockedDay = usageDay();
+                        switchToLocal = true;
+                        break;
+                    } else if (e.status === 429) {
                         // 額度或速度上限：放回佇列，等一分鐘再試
                         prefQueue.unshift(...jobs);
                         cloudNextAt = Date.now() + CLOUD_QUOTA_WAIT_MS;
@@ -1025,6 +1083,12 @@
             }
         } finally {
             prefRunning = false;
+        }
+        if (switchToLocal) {
+            console.warn(`[Threads Filter] ${cloudName()} ${cloudBlocked === 'region' ? '不支援目前的網路地區（多半是開了 VPN）' : '今日額度已用完'}，本頁改用 Chrome 內建 AI`);
+            prefBaseDirty = true;
+            prefStatus = 'idle';
+            initPrefModel();
         }
     }
 
@@ -1078,6 +1142,12 @@
 
     function getPrefStatusText() {
         if (!config.aiPreference) return '🧠 喜好 AI：已關閉（竄改猴選單可開啟）';
+        if (hasCloudAi() && !useCloudAi()) {
+            const why = cloudBlocked === 'region'
+                ? `${cloudName()} 不支援你目前的網路地區（多半是開了 VPN），關掉 VPN 後重新整理即可恢復`
+                : `${cloudName()} 今日額度用完，美西午夜（台灣下午 3～4 點）後自動恢復`;
+            return `⚠️ ${why}・${getCloudUsageText()}｜` + getLocalPrefStatusText().replace('🧠 喜好 AI：', '🧠 喜好 AI（暫用 Chrome 內建）：');
+        }
         if (hasCloudAi()) {
             const name = cloudName();
             switch (prefStatus) {
@@ -1088,10 +1158,14 @@
                 case 'error': return `🧠 喜好 AI（${name}）：請求失敗（詳見主控台），下一批會再試`;
                 case 'ready':
                     return `🧠 喜好 AI（${name}${cloudModel ? ' ' + cloudModel : ''}）：運作中・${getPrefLearnedText()}・本頁判斷 ${prefStats.checked} 則、藏 ${prefStats.hidden} 則` +
-                        (prefQueue.length ? `・排隊 ${prefQueue.length}` : '');
+                        (prefQueue.length ? `・排隊 ${prefQueue.length}` : '') + `・${getCloudUsageText()}`;
                 default: return `🧠 喜好 AI（${name}）：檢查中…`;
             }
         }
+        return getLocalPrefStatusText();
+    }
+
+    function getLocalPrefStatusText() {
         switch (prefStatus) {
             case 'unsupported': return '🧠 喜好 AI：此瀏覽器或電腦不支援；可從竄改猴選單設定 Gemini API 金鑰改用雲端';
             case 'need-click': return '🧠 喜好 AI：點一下頁面任意處開始下載模型（約 2～4 GB）';
@@ -1212,7 +1286,7 @@
         if (!badgeEl) return;
 
         // 狀態沒變就不重寫 DOM，避免觸發 MutationObserver 造成每幀空轉
-        const state = `${config.enabled}|${hiddenPosts.size}|${aiStatus}|${prefStatus}`;
+        const state = `${config.enabled}|${hiddenPosts.size}|${aiStatus}|${prefStatus}|${cloudBlocked}`;
         if (state !== lastBadgeState) {
             lastBadgeState = state;
 
@@ -1221,6 +1295,7 @@
             if (aiStatus === 'ready') aiIcons += '🤖';
             if (prefStatus === 'ready') aiIcons += '🧠';
             if (prefStatus === 'quota') aiIcons += '🧠⏸';
+            if (cloudBlocked) aiIcons += '🌐';
             if (prefStatus === 'bad-key' || prefStatus === 'error') aiIcons += '🧠⚠️';
             if (aiStatus === 'downloading' || prefStatus === 'downloading') aiIcons += '⏳';
             if (aiIcons) aiIcons = ` · ${aiIcons}`;
@@ -1645,10 +1720,10 @@
 
         const items = [];
         const seen = new Set();
-        const add = (url, fallbackExt) => {
+        const add = (url, fallbackExt, image) => {
             if (!url || seen.has(url)) return;
             seen.add(url);
-            items.push({ url, ext: getExtension(url, fallbackExt) });
+            items.push({ url, ext: getExtension(url, fallbackExt), image });
         };
 
         let blobVideos = 0;
@@ -1661,7 +1736,7 @@
             }
             add(url, 'mp4');
         });
-        getMediaImages(post).forEach((img) => add(getBestImageUrl(img), 'jpg'));
+        getMediaImages(post).forEach((img) => add(getBestImageUrl(img), 'jpg', true));
 
         if (items.length === 0) {
             btn.textContent = blobVideos ? '⚠ 這支影片是串流格式，無法下載' : '⚠ 找不到可下載的檔案';
@@ -1673,7 +1748,11 @@
         for (let i = 0; i < items.length; i++) {
             btn.textContent = `⬇ 下載中 ${i + 1}/${items.length}…`;
             const suffix = items.length > 1 ? `_${i + 1}` : '';
-            if (await downloadFile(items[i].url, `${prefix}${suffix}.${items[i].ext}`)) ok++;
+            const item = items[i];
+            const done = item.image && config.imageFormat === 'jpg'
+                ? await downloadImageAsJpg(item.url, `${prefix}${suffix}`, item.ext)
+                : await downloadFile(item.url, `${prefix}${suffix}.${item.ext}`);
+            if (done) ok++;
         }
         btn.disabled = false;
 
@@ -1682,6 +1761,188 @@
         if (failed) msg += `，${failed} 個改開新分頁`;
         if (blobVideos) msg += `，${blobVideos} 支串流影片無法下載`;
         btn.textContent = msg;
+    }
+
+    // ==========================================
+    // 4b. 圖片轉 JPG
+    // ==========================================
+    // Threads 的圖多半是 WebP。跨網域的 <img> 直接畫到 canvas 會被「污染」無法匯出，
+    // 所以用 GM_xmlhttpRequest 把原檔抓成 Blob（不受 CORS 限制），
+    // 解碼後先鋪白底（JPG 沒有透明度）再畫上去，最後用 canvas.toBlob 輸出 JPG。
+
+    function fetchImageBlob(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                responseType: 'blob',
+                onload: (res) => (res.status >= 200 && res.status < 300 ? resolve(res.response) : reject(new Error(`HTTP ${res.status}`))),
+                onerror: () => reject(new Error('網路錯誤')),
+                ontimeout: () => reject(new Error('逾時'))
+            });
+        });
+    }
+
+    async function convertToJpg(blob) {
+        const bitmap = await createImageBitmap(blob);
+        const canvas = document.createElement('canvas');
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        return new Promise((resolve, reject) => {
+            canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('轉檔失敗'))), 'image/jpeg', config.jpgQuality);
+        });
+    }
+
+    // 先走 GM_download（不會觸發 Chrome「下載多個檔案」的詢問），不支援 blob 網址時改用 <a download>
+    function saveBlob(blob, name) {
+        const url = URL.createObjectURL(blob);
+        const viaAnchor = () => {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        };
+        return new Promise((resolve) => {
+            const finish = () => {
+                setTimeout(() => URL.revokeObjectURL(url), 10000);
+                resolve(true);
+            };
+            if (typeof GM_download !== 'function') {
+                viaAnchor();
+                finish();
+                return;
+            }
+            GM_download({
+                url,
+                name,
+                onload: finish,
+                onerror: () => { viaAnchor(); finish(); },
+                ontimeout: () => { viaAnchor(); finish(); }
+            });
+        });
+    }
+
+    /**
+     * 下載單張圖片並轉成 JPG；轉檔失敗就退回下載原檔
+     * @param {string} baseName 不含副檔名的檔名
+     * @param {string} originalExt 退回原檔時用的副檔名
+     */
+    async function downloadImageAsJpg(url, baseName, originalExt) {
+        try {
+            return await saveBlob(await convertToJpg(await fetchImageBlob(url)), `${baseName}.jpg`);
+        } catch (e) {
+            console.warn('[Threads Filter] 轉 JPG 失敗，改下載原檔', url, e);
+            return downloadFile(url, `${baseName}.${originalExt}`);
+        }
+    }
+
+    // ---------- 滑到圖片上的「⬇ JPG」按鈕，Alt + 點圖片直接下載 ----------
+    const POST_SELECTOR = 'article, div[data-pressable-container="true"]';
+    let jpgBtn = null;
+    let jpgHoverImg = null;
+
+    function isJpgCandidate(img) {
+        const r = img.getBoundingClientRect();
+        if (r.width < 120 || r.height < 120) return false;
+        if (/大頭貼|profile picture/i.test(img.alt || '')) return false;
+        return /cdninstagram\.com|fbcdn\.net/.test(getBestImageUrl(img));
+    }
+
+    // Threads 常在圖片上蓋一層透明 div，mouseover 不一定落在 <img> 上，
+    // 所以用 elementsFromPoint 把游標底下的每一層翻出來找 <img>
+    function findJpgImageAt(x, y) {
+        for (const el of document.elementsFromPoint(x, y)) {
+            if (el === jpgBtn) return jpgHoverImg;
+            if (el.tagName === 'IMG' && isJpgCandidate(el)) return el;
+        }
+        return null;
+    }
+
+    // 檔名比照整則下載：threads_帳號_貼文代碼(_第幾張)
+    function jpgBaseName(img) {
+        let post = null;
+        let el = img;
+        while (el && (el = el.parentElement && el.parentElement.closest(POST_SELECTOR))) post = el;
+
+        const info = post ? getPostInfo(post) : { author: '', href: location.href };
+        const author = info.author || (location.pathname.match(/^\/@([^/?#]+)/) || [])[1] || 'unknown';
+        const postId = (info.href.match(/\/post\/([^/?#]+)/) || [])[1] || Date.now().toString(36);
+        const images = post ? getMediaImages(post) : [];
+        const index = images.indexOf(img);
+        const suffix = images.length > 1 && index >= 0 ? `_${index + 1}` : '';
+        return `threads_${author}_${postId}${suffix}`;
+    }
+
+    async function downloadHoveredImage(img) {
+        const url = getBestImageUrl(img);
+        const baseName = jpgBaseName(img);
+        const label = jpgBtn.textContent;
+        jpgBtn.textContent = '⏳';
+        const ok = config.imageFormat === 'jpg'
+            ? await downloadImageAsJpg(url, baseName, getExtension(url, 'jpg'))
+            : await downloadFile(url, `${baseName}.${getExtension(url, 'jpg')}`);
+        jpgBtn.textContent = ok ? '✓' : '⚠';
+        setTimeout(() => { jpgBtn.textContent = label; }, 1500);
+    }
+
+    function placeJpgButton(img) {
+        const r = img.getBoundingClientRect();
+        jpgBtn.style.top = `${Math.max(r.top, 0) + 8}px`;
+        jpgBtn.style.left = `${r.right - jpgBtn.offsetWidth - 8}px`;
+    }
+
+    function initJpgHover() {
+        if (!config.hoverJpgButton) return;
+
+        jpgBtn = document.createElement('button');
+        jpgBtn.id = 'threads-jpg-btn';
+        jpgBtn.textContent = config.imageFormat === 'jpg' ? '⬇ JPG' : '⬇ 原圖';
+        jpgBtn.title = '下載這張圖（Alt + 點圖片也可以）';
+        jpgBtn.setAttribute('style', 'position:fixed;z-index:2147483647;display:none;padding:4px 10px;border:none;border-radius:9999px;background:rgba(0,0,0,.72);color:#fff;font:600 12px/1.4 system-ui,sans-serif;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.4);');
+        // 燈箱與貼文都會在 pointerdown/click 上做事（關閉、跳轉），按鈕的事件不能往上傳
+        ['pointerdown', 'mousedown', 'mouseup', 'pointerup'].forEach((type) => {
+            jpgBtn.addEventListener(type, (e) => e.stopPropagation());
+        });
+        jpgBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (jpgHoverImg) downloadHoveredImage(jpgHoverImg);
+        });
+        document.body.appendChild(jpgBtn);
+
+        let raf = 0;
+        document.addEventListener('mousemove', (e) => {
+            if (raf) return;
+            raf = requestAnimationFrame(() => {
+                raf = 0;
+                if (!jpgBtn.isConnected) document.body.appendChild(jpgBtn);
+                const img = findJpgImageAt(e.clientX, e.clientY);
+                jpgHoverImg = img;
+                jpgBtn.style.display = img ? 'block' : 'none';
+                if (img) placeJpgButton(img);
+            });
+        }, { passive: true });
+
+        window.addEventListener('scroll', () => {
+            if (jpgHoverImg) placeJpgButton(jpgHoverImg);
+        }, { passive: true });
+
+        document.addEventListener('click', (e) => {
+            if (!e.altKey) return;
+            const img = findJpgImageAt(e.clientX, e.clientY);
+            if (!img) return;
+            e.preventDefault();
+            e.stopPropagation();
+            jpgHoverImg = img;
+            downloadHoveredImage(img);
+        }, true);
     }
 
     // ==========================================
@@ -2171,10 +2432,22 @@
     // ==========================================
     // 6. 油猴選單指令註冊 (Tampermonkey Menu)
     // ==========================================
+    let menuIds = [];
+
     function registerMenuCommands() {
         if (typeof GM_registerMenuCommand !== 'function') return;
 
-        GM_registerMenuCommand(
+        // 選單太長：平常只列常用的幾項，其餘收進「更多設定」。
+        // 不支援 GM_unregisterMenuCommand 的管理器沒辦法重畫選單，就一律全部列出
+        const canCollapse = typeof GM_unregisterMenuCommand === 'function';
+        if (canCollapse) menuIds.forEach((id) => GM_unregisterMenuCommand(id));
+        menuIds = [];
+        let pinned = true;
+        const add = (label, fn) => {
+            if (pinned || config.menuExpanded || !canCollapse) menuIds.push(GM_registerMenuCommand(label, fn));
+        };
+
+        add(
             config.enabled ? '🟢 過濾開關：[啟用中]（點擊切換）' : '⚪ 過濾開關：[已暫停]（點擊切換）',
             () => {
                 config.enabled = !config.enabled;
@@ -2183,43 +2456,7 @@
             }
         );
 
-        GM_registerMenuCommand(
-            config.enableImageZoom ? '🔍 點開圖片縮放：[開啟]（點擊切換）' : '❌ 點開圖片縮放：[關閉]（點擊切換）',
-            () => {
-                config.enableImageZoom = !config.enableImageZoom;
-                saveConfig(config);
-                location.reload();
-            }
-        );
-
-        GM_registerMenuCommand(
-            config.filterTranslationPosts ? '✅ 帶翻譯按鈕外語：[一律隱藏]（點擊切換）' : '❌ 帶翻譯按鈕外語：[關閉]（點擊切換）',
-            () => {
-                config.filterTranslationPosts = !config.filterTranslationPosts;
-                saveConfig(config);
-                location.reload();
-            }
-        );
-
-        GM_registerMenuCommand(
-            config.filterJapanese ? '✅ 日文過濾：[開啟]（點擊切換）' : '❌ 日文過濾：[關閉]（點擊切換）',
-            () => {
-                config.filterJapanese = !config.filterJapanese;
-                saveConfig(config);
-                location.reload();
-            }
-        );
-
-        GM_registerMenuCommand(
-            config.filterKorean ? '✅ 韓文過濾：[開啟]（點擊切換）' : '❌ 韓文過濾：[關閉]（點擊切換）',
-            () => {
-                config.filterKorean = !config.filterKorean;
-                saveConfig(config);
-                location.reload();
-            }
-        );
-
-        GM_registerMenuCommand(
+        add(
             config.aiPreference ? '🧠 喜好 AI：[開啟]（點擊切換）' : '🧠 喜好 AI：[關閉]（點擊切換）',
             () => {
                 config.aiPreference = !config.aiPreference;
@@ -2228,12 +2465,61 @@
             }
         );
 
-        GM_registerMenuCommand(
-            hasCloudAi() ? `🔑 雲端 AI：[${cloudName()}]（點擊更換或清除）` : '🔑 設定雲端 AI（Gemini / GPT / Groq / OpenRouter）…',
+        add(
+            hasCloudAi() ? `🔑 雲端 AI：[${cloudName()}・今日 ${getCloudUsage().requests} 次]（點擊更換或清除）` : '🔑 設定雲端 AI（Gemini / GPT / Groq / OpenRouter）…',
             configureCloudAi
         );
 
-        GM_registerMenuCommand(
+        if (canCollapse) {
+            menuIds.push(GM_registerMenuCommand(
+                config.menuExpanded ? '▲ 收合更多設定' : '▼ 更多設定…',
+                () => {
+                    config.menuExpanded = !config.menuExpanded;
+                    saveConfig(config);
+                    registerMenuCommands();
+                },
+                { autoClose: false }
+            ));
+        }
+        pinned = false;
+
+        add(
+            config.enableImageZoom ? '🔍 點開圖片縮放：[開啟]（點擊切換）' : '❌ 點開圖片縮放：[關閉]（點擊切換）',
+            () => {
+                config.enableImageZoom = !config.enableImageZoom;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        add(
+            config.filterTranslationPosts ? '✅ 帶翻譯按鈕外語：[一律隱藏]（點擊切換）' : '❌ 帶翻譯按鈕外語：[關閉]（點擊切換）',
+            () => {
+                config.filterTranslationPosts = !config.filterTranslationPosts;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        add(
+            config.filterJapanese ? '✅ 日文過濾：[開啟]（點擊切換）' : '❌ 日文過濾：[關閉]（點擊切換）',
+            () => {
+                config.filterJapanese = !config.filterJapanese;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        add(
+            config.filterKorean ? '✅ 韓文過濾：[開啟]（點擊切換）' : '❌ 韓文過濾：[關閉]（點擊切換）',
+            () => {
+                config.filterKorean = !config.filterKorean;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        add(
             config.dislikeTopics.trim() ? `📝 不想看的主題：[${config.dislikeTopics.trim().slice(0, 20)}]（點擊修改）` : '📝 設定不想看的主題（告訴喜好 AI）…',
             () => {
                 const v = window.prompt(
@@ -2247,7 +2533,7 @@
             }
         );
 
-        GM_registerMenuCommand(
+        add(
             `🧠 清除喜好 AI 學到的例子（目前 ${config.dislikeExamples.length} 則不喜歡、${config.keepExamples.length} 則保留）`,
             () => {
                 if (!window.confirm('清除喜好 AI 學到的所有例子？（不想看的主題會保留）')) return;
@@ -2259,7 +2545,7 @@
             }
         );
 
-        GM_registerMenuCommand(
+        add(
             config.aiLanguageDetect ? '🤖 AI 語言偵測：[開啟]（點擊切換）' : '🤖 AI 語言偵測：[關閉]（點擊切換）',
             () => {
                 config.aiLanguageDetect = !config.aiLanguageDetect;
@@ -2268,7 +2554,7 @@
             }
         );
 
-        GM_registerMenuCommand(
+        add(
             config.keepMediaPosts ? '🖼️ 圖片/影片貼文：[一律保留]（點擊切換）' : '🖼️ 圖片/影片貼文：[照常過濾]（點擊切換）',
             () => {
                 config.keepMediaPosts = !config.keepMediaPosts;
@@ -2279,7 +2565,8 @@
 
         const SCAM_MODE_LABELS ={ warn: '⚠️ [紅框提醒]', hide: '🚫 [直接隱藏]', off: '❌ [不處理]' };
         const SCAM_MODE_NEXT = { warn: 'hide', hide: 'off', off: 'warn' };
-        GM_registerMenuCommand(
+
+        add(
             `非台灣新帳號（詐騙）：${SCAM_MODE_LABELS[config.scamMode] || SCAM_MODE_LABELS.warn}（點擊切換）`,
             () => {
                 config.scamMode = SCAM_MODE_NEXT[config.scamMode] || 'warn';
@@ -2288,10 +2575,33 @@
             }
         );
 
-        GM_registerMenuCommand(
+        add(
             config.hidePureMedia ?'✅ 無文字純影音：[隱藏]（點擊切換）' : '❌ 無文字純影音：[保留]（點擊切換）',
             () => {
                 config.hidePureMedia = !config.hidePureMedia;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        const IMAGE_FORMAT_LABELS = { jpg92: '[轉 JPG 92%]', jpg100: '[轉 JPG 100%]', original: '[原始檔]' };
+        const IMAGE_FORMAT_NEXT = { jpg92: 'jpg100', jpg100: 'original', original: 'jpg92' };
+        const imageFormatKey = config.imageFormat === 'original' ? 'original' : (config.jpgQuality >= 1 ? 'jpg100' : 'jpg92');
+        add(
+            `🖼️ 下載圖片格式：${IMAGE_FORMAT_LABELS[imageFormatKey]}（點擊切換）`,
+            () => {
+                const next = IMAGE_FORMAT_NEXT[imageFormatKey];
+                config.imageFormat = next === 'original' ? 'original' : 'jpg';
+                config.jpgQuality = next === 'jpg100' ? 1 : 0.92;
+                saveConfig(config);
+                location.reload();
+            }
+        );
+
+        add(
+            config.hoverJpgButton ? '⬇ 圖片上的下載按鈕：[開啟]（點擊切換）' : '⬇ 圖片上的下載按鈕：[關閉]（點擊切換）',
+            () => {
+                config.hoverJpgButton = !config.hoverJpgButton;
                 saveConfig(config);
                 location.reload();
             }
@@ -2320,6 +2630,7 @@
         processFeed();
         addPostTools();
         checkActiveImageLifecycle();
+        initJpgHover();
         initAiDetector();
         initPrefModel();
 
